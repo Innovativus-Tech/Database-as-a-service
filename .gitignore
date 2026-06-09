@@ -6,3 +6,17 @@ node_modules/
 dist/
 build/
 .next/
+
+# Per-user database data volumes (mongodb journal files, postgres data, etc.)
+# Runtime state, never committed.
+data/
+var/
+
+# Dynamically generated nginx stream blocks (backend writes these at runtime).
+nginx/stream.d/*.conf
+!nginx/stream.d/.gitkeep
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
