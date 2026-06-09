@@ -1,0 +1,74 @@
+// CustomDB meta database schema
+// Stores users, their provisioned databases, and per-database credentials.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Plan {
+  free
+  pro
+}
+
+enum DatabaseType {
+  nosql
+  sql
+}
+
+enum DatabaseStatus {
+  provisioning
+  active
+  stopped
+  deleted
+}
+
+model User {
+  id           String     @id @default(uuid()) @db.Uuid
+  email        String     @unique
+  passwordHash String
+  plan         Plan       @default(free)
+  createdAt    DateTime   @default(now())
+
+  databases    Database[]
+
+  @@map("users")
+}
+
+model Database {
+  id              String         @id @default(uuid()) @db.Uuid
+  userId          String         @db.Uuid
+  dbName          String
+  type            DatabaseType
+  port            Int            @unique
+  host            String
+  status          DatabaseStatus @default(provisioning)
+  storageUsed     BigInt         @default(0)
+  containerName   String?        @unique
+  routing         String?        // null = legacy direct port binding; "nginx" = via nginx proxy
+  createdAt       DateTime       @default(now())
+  lastConnectedAt DateTime?
+
+  user        User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  credentials Credential[]
+
+  @@unique([userId, dbName])
+  @@index([userId])
+  @@map("databases")
+}
+
+model Credential {
+  id                String   @id @default(uuid()) @db.Uuid
+  databaseId        String   @db.Uuid
+  username          String
+  passwordEncrypted String
+
+  database Database @relation(fields: [databaseId], references: [id], onDelete: Cascade)
+
+  @@index([databaseId])
+  @@map("credentials")
+}

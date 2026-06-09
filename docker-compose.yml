@@ -1,0 +1,85 @@
+# CustomDB — single-host deployment (Coolify VPS or any Linux box with Docker).
+#
+# Notes:
+#  - The backend mounts /var/run/docker.sock so Dockerode can provision user DB containers.
+#  - User DB containers are created on the customdb-network (external, see bottom).
+#  - Nginx listens on a wide port range (27018-27999 + 5433-5999) and proxies by container
+#    name to the user DBs on customdb-network.
+#  - The meta DB and per-user data volumes are stored under ./var on the host.
+
+services:
+  meta-db:
+    image: postgres:16
+    container_name: customdb-meta
+    environment:
+      POSTGRES_USER: customdb
+      POSTGRES_PASSWORD: ${META_DB_PASSWORD:-customdb}
+      POSTGRES_DB: customdb_meta
+    volumes:
+      - meta-db-data:/var/lib/postgresql/data
+    networks: [customdb-network]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U customdb"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  backend:
+    build: ./backend
+    container_name: customdb-backend
+    depends_on:
+      meta-db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://customdb:${META_DB_PASSWORD:-customdb}@meta-db:5432/customdb_meta?schema=public
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_EXPIRES_IN: 7d
+      VPS_HOST: ${VPS_HOST}
+      DOCKER_SOCKET: /var/run/docker.sock
+      CREDENTIAL_ENC_KEY: ${CREDENTIAL_ENC_KEY}
+      DATA_ROOT: /data
+      PORT: 4000
+      NODE_ENV: production
+      FRONTEND_ORIGIN: ${FRONTEND_ORIGIN}
+      CUSTOMDB_NETWORK: customdb-network
+      NGINX_CONTAINER: customdb-nginx
+      NGINX_STREAM_DIR: /etc/nginx/stream.d
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./var/data:/data
+      - ./nginx/stream.d:/etc/nginx/stream.d
+    networks: [customdb-network]
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    container_name: customdb-frontend
+    environment:
+      NEXT_PUBLIC_API_URL: ${PUBLIC_API_URL}
+    ports:
+      - "3030:3030"
+    networks: [customdb-network]
+    restart: unless-stopped
+
+  nginx:
+    build: ./nginx
+    container_name: customdb-nginx
+    depends_on: [backend]
+    volumes:
+      - ./nginx/stream.d:/etc/nginx/stream.d
+    ports:
+      # MongoDB port range
+      - "27018-27999:27018-27999"
+      # PostgreSQL port range
+      - "5433-5999:5433-5999"
+    networks: [customdb-network]
+    restart: unless-stopped
+
+volumes:
+  meta-db-data:
+
+networks:
+  customdb-network:
+    name: customdb-network
+    driver: bridge
