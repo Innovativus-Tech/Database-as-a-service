@@ -31,9 +31,6 @@ services:
     depends_on:
       meta-db:
         condition: service_healthy
-    ports:
-      # Publish the Express API on the host. Pick a port that's free on the VPS.
-      - "4080:4000"
     environment:
       DATABASE_URL: postgresql://customdb:${META_DB_PASSWORD:-customdb}@meta-db:5432/customdb_meta?schema=public
       JWT_SECRET: ${JWT_SECRET}
