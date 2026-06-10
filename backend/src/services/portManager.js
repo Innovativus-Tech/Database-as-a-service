@@ -1,8 +1,16 @@
 const prisma = require('../prisma');
 
+// Bounds must match the nginx `ports:` range in docker-compose.yml.
+// Override via env (NOSQL_PORT_MIN/MAX, SQL_PORT_MIN/MAX) if you widen the range.
 const PORT_RANGES = {
-  nosql: { min: 27018, max: 27999 },
-  sql:   { min: 5433,  max: 5999  },
+  nosql: {
+    min: Number(process.env.NOSQL_PORT_MIN) || 27018,
+    max: Number(process.env.NOSQL_PORT_MAX) || 27117,
+  },
+  sql: {
+    min: Number(process.env.SQL_PORT_MIN) || 5433,
+    max: Number(process.env.SQL_PORT_MAX) || 5532,
+  },
 };
 
 async function getNextAvailablePort(type) {

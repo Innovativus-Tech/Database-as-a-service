@@ -69,10 +69,11 @@ services:
     volumes:
       - ./nginx/stream.d:/etc/nginx/stream.d
     ports:
-      # MongoDB port range
-      - "27018-27999:27018-27999"
-      # PostgreSQL port range
-      - "5433-5999:5433-5999"
+      # MongoDB port range (100 ports). Wider ranges cause docker-compose to
+      # spend minutes setting up iptables rules per port and Coolify times out.
+      - "27018-27117:27018-27117"
+      # PostgreSQL port range (100 ports).
+      - "5433-5532:5433-5532"
     networks: [customdb-network]
     restart: unless-stopped
 
