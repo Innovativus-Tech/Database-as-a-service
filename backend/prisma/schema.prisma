@@ -2,7 +2,10 @@
 // Stores users, their provisioned databases, and per-database credentials.
 
 generator client {
-  provider = "prisma-client-js"
+  provider      = "prisma-client-js"
+  // native = local dev (your Mac).
+  // linux-musl-openssl-3.0.x = Alpine 3.18+ on x86_64 (our Dockerfile).
+  binaryTargets = ["native", "linux-musl-openssl-3.0.x"]
 }
 
 datasource db {

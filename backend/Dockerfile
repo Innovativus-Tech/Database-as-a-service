@@ -2,14 +2,14 @@ FROM node:20-alpine AS deps
 WORKDIR /app
 
 # Docker CLI (for `docker cp` and `docker exec` from inside the backend container).
-RUN apk add --no-cache docker-cli
+RUN apk add --no-cache docker-cli openssl libc6-compat
 
 COPY package.json package-lock.json* ./
 RUN npm ci --omit=dev
 
 FROM node:20-alpine AS runner
 WORKDIR /app
-RUN apk add --no-cache docker-cli
+RUN apk add --no-cache docker-cli openssl libc6-compat
 
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
