@@ -31,6 +31,12 @@ services:
     depends_on:
       meta-db:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:4000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     environment:
       DATABASE_URL: postgresql://customdb:${META_DB_PASSWORD:-customdb}@meta-db:5432/customdb_meta?schema=public
       JWT_SECRET: ${JWT_SECRET}
