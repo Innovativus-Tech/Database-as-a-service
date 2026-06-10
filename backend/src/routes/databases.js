@@ -19,6 +19,12 @@ const {
 } = require('../services/provisioning');
 const { dispatchImport } = require('../services/dataImport');
 const { addStreamBlock, removeStreamBlock, reloadNginx } = require('../services/nginxManager');
+const {
+  listMongoCollections,
+  browseMongoCollection,
+  listPostgresTables,
+  browsePostgresTable,
+} = require('../services/dataBrowser');
 
 const upload = multer({
   storage: multer.diskStorage({
@@ -238,6 +244,76 @@ router.get('/:id/stats', requireAuth, async (req, res, next) => {
     });
   } catch (err) {
     next(err);
+  }
+});
+
+// Helper: load DB with creds, build connection URL — used by browse routes.
+async function loadDatabaseWithUrl(userId, id) {
+  const db = await prisma.database.findFirst({
+    where: { id, userId, status: 'active' },
+    include: { credentials: true },
+  });
+  if (!db) return null;
+  const cred = db.credentials[0];
+  const password = decrypt(cred.passwordEncrypted);
+  const connectionUrl = generateConnectionURL(db.type, {
+    host: db.host, port: db.port, username: cred.username, password, dbName: db.dbName,
+  });
+  return { db, connectionUrl };
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// GET /api/databases/:id/collections  — list collections / tables
+// ──────────────────────────────────────────────────────────────────────────────
+router.get('/:id/collections', requireAuth, async (req, res, next) => {
+  if (!validIdOr404(req, res)) return;
+  try {
+    const loaded = await loadDatabaseWithUrl(req.user.id, req.params.id);
+    if (!loaded) return res.status(404).json({ error: 'Database not found or not active' });
+    const { db, connectionUrl } = loaded;
+
+    const collections = db.type === 'nosql'
+      ? await listMongoCollections(connectionUrl, db.dbName)
+      : await listPostgresTables(connectionUrl);
+
+    res.json({ collections, type: db.type });
+  } catch (err) {
+    const status = err.status || 500;
+    res.status(status).json({ error: err.message || 'Failed to list collections' });
+  }
+});
+
+// ──────────────────────────────────────────────────────────────────────────────
+// GET /api/databases/:id/collections/:name?skip=&limit=&filter=
+//   filter (mongo only) is a URI-encoded JSON object: ?filter=%7B%22age%22%3A30%7D
+// ──────────────────────────────────────────────────────────────────────────────
+router.get('/:id/collections/:name', requireAuth, async (req, res, next) => {
+  if (!validIdOr404(req, res)) return;
+  try {
+    const loaded = await loadDatabaseWithUrl(req.user.id, req.params.id);
+    if (!loaded) return res.status(404).json({ error: 'Database not found or not active' });
+    const { db, connectionUrl } = loaded;
+    const collection = req.params.name;
+    const skip = Math.max(0, parseInt(req.query.skip || '0', 10) || 0);
+    const limit = Math.max(1, Math.min(500, parseInt(req.query.limit || '50', 10) || 50));
+
+    if (db.type === 'nosql') {
+      let filter = {};
+      if (req.query.filter) {
+        try { filter = JSON.parse(req.query.filter); }
+        catch { return res.status(400).json({ error: 'filter must be valid JSON' }); }
+      }
+      const result = await browseMongoCollection({
+        connectionUrl, dbName: db.dbName, collection, skip, limit, filter,
+      });
+      return res.json({ name: collection, type: 'nosql', ...result });
+    }
+
+    const result = await browsePostgresTable({ connectionUrl, table: collection, skip, limit });
+    res.json({ name: collection, type: 'sql', ...result });
+  } catch (err) {
+    const status = err.status || 500;
+    res.status(status).json({ error: err.message || 'Failed to browse collection' });
   }
 });
 

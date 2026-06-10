@@ -60,4 +60,10 @@ export const api = {
     const qs = target ? `?target=${encodeURIComponent(target)}` : '';
     return request(`/api/databases/${id}/import${qs}`, { method: 'POST', formData: fd });
   },
+  listCollections: (id) => request(`/api/databases/${id}/collections`),
+  browseCollection: (id, name, { skip = 0, limit = 50, filter } = {}) => {
+    const params = new URLSearchParams({ skip: String(skip), limit: String(limit) });
+    if (filter) params.set('filter', filter);
+    return request(`/api/databases/${id}/collections/${encodeURIComponent(name)}?${params}`);
+  },
 };

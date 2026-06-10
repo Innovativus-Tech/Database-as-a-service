@@ -6,6 +6,7 @@ import Link from 'next/link';
 import { api } from '@/lib/api';
 import { useRequireAuth, useAuth } from '@/lib/auth';
 import CopyButton from '@/components/CopyButton';
+import DataBrowser from '@/components/DataBrowser';
 
 function fmtBytes(n) {
   if (!n || n < 1024) return `${n || 0} B`;
@@ -145,6 +146,12 @@ export default function DatabaseDetailPage() {
         ) : (
           <p className="text-sm text-slate-500">Loading stats...</p>
         )}
+      </section>
+
+      {/* Data browser */}
+      <section className="rounded-lg border border-slate-200 bg-white p-5">
+        <h2 className="mb-3 text-sm font-medium uppercase tracking-wide text-slate-500">Browse data</h2>
+        <DataBrowser databaseId={id} dbType={db.type} />
       </section>
 
       {/* Import */}
