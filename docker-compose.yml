@@ -58,6 +58,12 @@ services:
       # straight to the Docker daemon, which interprets it on the host.
       - /data:/data
       - ./nginx/stream.d:/etc/nginx/stream.d
+    networks:
+      # default = Coolify's auto-network so Traefik can route to /health, /api/*
+      - default
+      # customdb-network = so backend can reach user DB containers by name
+      # for data browser / import (drivers use the internal Docker DNS).
+      - customdb-network
     restart: unless-stopped
 
   frontend:
