@@ -14,6 +14,12 @@ app.use(cors({
 app.use(express.json({ limit: '1mb' }));
 app.use(morgan(process.env.NODE_ENV === 'development' ? 'dev' : 'combined'));
 
+// Root path — answer 200 OK so Coolify-Traefik's default healthcheck doesn't
+// mark the container unhealthy (it probes / by default and 404 = drop the route).
+app.get('/', (req, res) => {
+  res.json({ service: 'customdb-backend', status: 'ok' });
+});
+
 app.get('/health', async (req, res) => {
   try {
     await prisma.$queryRaw`SELECT 1`;
