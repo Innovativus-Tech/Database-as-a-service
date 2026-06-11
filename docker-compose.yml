@@ -17,7 +17,6 @@ services:
       POSTGRES_DB: customdb_meta
     volumes:
       - meta-db-data:/var/lib/postgresql/data
-    networks: [customdb-network]
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U customdb -d customdb_meta"]
@@ -55,7 +54,6 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./var/data:/data
       - ./nginx/stream.d:/etc/nginx/stream.d
-    networks: [customdb-network]
     restart: unless-stopped
 
   frontend:
@@ -70,7 +68,6 @@ services:
       NEXT_PUBLIC_API_URL: ${PUBLIC_API_URL}
     ports:
       - "3030:3030"
-    networks: [customdb-network]
     restart: unless-stopped
 
   nginx:
