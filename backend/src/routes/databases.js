@@ -247,7 +247,10 @@ router.get('/:id/stats', requireAuth, async (req, res, next) => {
   }
 });
 
-// Helper: load DB with creds, build connection URL — used by browse routes.
+// Helper: load DB with creds, build BOTH a public connection URL (what we hand
+// to the user, points at VPS_HOST:nginx-port) and an internal one (used by the
+// backend's own MongoDB / PG drivers — they run inside the backend container
+// and reach user DBs by container name on customdb-network).
 async function loadDatabaseWithUrl(userId, id) {
   const db = await prisma.database.findFirst({
     where: { id, userId, status: 'active' },
@@ -256,10 +259,26 @@ async function loadDatabaseWithUrl(userId, id) {
   if (!db) return null;
   const cred = db.credentials[0];
   const password = decrypt(cred.passwordEncrypted);
+
   const connectionUrl = generateConnectionURL(db.type, {
     host: db.host, port: db.port, username: cred.username, password, dbName: db.dbName,
   });
-  return { db, connectionUrl };
+
+  // For nginx-routed DBs we have the container name + the internal port (27017 / 5432).
+  // For legacy direct-bind DBs containerName may be null; fall back to the public URL.
+  let internalUrl = connectionUrl;
+  if (db.routing === 'nginx' && db.containerName) {
+    const internalPort = db.type === 'nosql' ? 27017 : 5432;
+    internalUrl = generateConnectionURL(db.type, {
+      host: db.containerName,
+      port: internalPort,
+      username: cred.username,
+      password,
+      dbName: db.dbName,
+    });
+  }
+
+  return { db, connectionUrl, internalUrl, credentials: { username: cred.username, password } };
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -270,11 +289,11 @@ router.get('/:id/collections', requireAuth, async (req, res, next) => {
   try {
     const loaded = await loadDatabaseWithUrl(req.user.id, req.params.id);
     if (!loaded) return res.status(404).json({ error: 'Database not found or not active' });
-    const { db, connectionUrl } = loaded;
+    const { db, internalUrl } = loaded;
 
     const collections = db.type === 'nosql'
-      ? await listMongoCollections(connectionUrl, db.dbName)
-      : await listPostgresTables(connectionUrl);
+      ? await listMongoCollections(internalUrl, db.dbName)
+      : await listPostgresTables(internalUrl);
 
     res.json({ collections, type: db.type });
   } catch (err) {
@@ -292,7 +311,7 @@ router.get('/:id/collections/:name', requireAuth, async (req, res, next) => {
   try {
     const loaded = await loadDatabaseWithUrl(req.user.id, req.params.id);
     if (!loaded) return res.status(404).json({ error: 'Database not found or not active' });
-    const { db, connectionUrl } = loaded;
+    const { db, internalUrl } = loaded;
     const collection = req.params.name;
     const skip = Math.max(0, parseInt(req.query.skip || '0', 10) || 0);
     const limit = Math.max(1, Math.min(500, parseInt(req.query.limit || '50', 10) || 50));
@@ -304,12 +323,12 @@ router.get('/:id/collections/:name', requireAuth, async (req, res, next) => {
         catch { return res.status(400).json({ error: 'filter must be valid JSON' }); }
       }
       const result = await browseMongoCollection({
-        connectionUrl, dbName: db.dbName, collection, skip, limit, filter,
+        connectionUrl: internalUrl, dbName: db.dbName, collection, skip, limit, filter,
       });
       return res.json({ name: collection, type: 'nosql', ...result });
     }
 
-    const result = await browsePostgresTable({ connectionUrl, table: collection, skip, limit });
+    const result = await browsePostgresTable({ connectionUrl: internalUrl, table: collection, skip, limit });
     res.json({ name: collection, type: 'sql', ...result });
   } catch (err) {
     const status = err.status || 500;
@@ -344,14 +363,25 @@ router.post('/:id/import', requireAuth, upload.single('file'), async (req, res, 
 
     const cred = db.credentials[0];
     const password = decrypt(cred.passwordEncrypted);
-    const connectionUrl = generateConnectionURL(db.type, {
-      host: db.host,
-      port: db.port,
-      username: cred.username,
-      password,
-      dbName: db.dbName,
-    });
     const { containerName } = resolveNames(db);
+
+    // For JSON/CSV imports the backend's own driver does the insertMany — it
+    // must reach the user DB via internal Docker DNS (container name on the
+    // customdb-network), not the public URL which doesn't route from inside.
+    // .zip and .sql imports use docker exec, so they don't need a network URL.
+    let connectionUrl;
+    if (db.routing === 'nginx' && db.containerName) {
+      const internalPort = db.type === 'nosql' ? 27017 : 5432;
+      connectionUrl = generateConnectionURL(db.type, {
+        host: db.containerName, port: internalPort,
+        username: cred.username, password, dbName: db.dbName,
+      });
+    } else {
+      connectionUrl = generateConnectionURL(db.type, {
+        host: db.host, port: db.port,
+        username: cred.username, password, dbName: db.dbName,
+      });
+    }
 
     const result = await dispatchImport({
       db,
