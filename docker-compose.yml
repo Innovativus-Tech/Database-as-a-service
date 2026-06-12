@@ -59,8 +59,8 @@ services:
       - /data:/data
       - ./nginx/stream.d:/etc/nginx/stream.d
     networks:
-      # default = Coolify's auto-network so Traefik can route to /health, /api/*
-      - default
+      # Coolify's proxy network = so Traefik can route public traffic to /api/*
+      - coolify
       # customdb-network = so backend can reach user DB containers by name
       # for data browser / import (drivers use the internal Docker DNS).
       - customdb-network
@@ -102,3 +102,9 @@ networks:
   customdb-network:
     name: customdb-network
     driver: bridge
+  # Coolify's proxy network (where Traefik lives). External = already exists,
+  # don't try to create it. Coolify creates this automatically when its proxy
+  # is enabled. If the network name is different on your install, change it here.
+  coolify:
+    external: true
+    name: coolify
