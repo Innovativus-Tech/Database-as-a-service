@@ -25,7 +25,7 @@ function inferTargetFromFilename(originalName, fallback) {
 // ──────────────────────────────────────────────────────────────────────────────
 // JSON → MongoDB
 // ──────────────────────────────────────────────────────────────────────────────
-async function importJsonToMongo({ connectionUrl, dbName, collection, filePath }) {
+async function importJsonToMongo({ connectionUrl, dbName, collection, filePath, onProgress }) {
   const raw = await fs.promises.readFile(filePath, 'utf8');
   let parsed;
   try { parsed = JSON.parse(raw); }
@@ -33,12 +33,21 @@ async function importJsonToMongo({ connectionUrl, dbName, collection, filePath }
 
   const docs = Array.isArray(parsed) ? parsed : [parsed];
   if (docs.length === 0) return { count: 0, target: collection };
+  onProgress?.(0, docs.length);
 
   const client = new MongoClient(connectionUrl);
   try {
     await client.connect();
-    const result = await client.db(dbName).collection(collection).insertMany(docs);
-    return { count: result.insertedCount, target: collection };
+    const col = client.db(dbName).collection(collection);
+    let inserted = 0;
+    const CHUNK = 500;
+    for (let start = 0; start < docs.length; start += CHUNK) {
+      const chunk = docs.slice(start, start + CHUNK);
+      const result = await col.insertMany(chunk);
+      inserted += result.insertedCount;
+      onProgress?.(inserted, docs.length);
+    }
+    return { count: inserted, target: collection };
   } finally {
     await client.close().catch(() => {});
   }
@@ -47,16 +56,25 @@ async function importJsonToMongo({ connectionUrl, dbName, collection, filePath }
 // ──────────────────────────────────────────────────────────────────────────────
 // CSV → MongoDB (rows become documents)
 // ──────────────────────────────────────────────────────────────────────────────
-async function importCsvToMongo({ connectionUrl, dbName, collection, filePath }) {
+async function importCsvToMongo({ connectionUrl, dbName, collection, filePath, onProgress }) {
   const raw = await fs.promises.readFile(filePath, 'utf8');
   const records = csvParse(raw, { columns: true, skip_empty_lines: true, trim: true });
   if (records.length === 0) return { count: 0, target: collection };
+  onProgress?.(0, records.length);
 
   const client = new MongoClient(connectionUrl);
   try {
     await client.connect();
-    const result = await client.db(dbName).collection(collection).insertMany(records);
-    return { count: result.insertedCount, target: collection };
+    const col = client.db(dbName).collection(collection);
+    let inserted = 0;
+    const CHUNK = 500;
+    for (let start = 0; start < records.length; start += CHUNK) {
+      const chunk = records.slice(start, start + CHUNK);
+      const result = await col.insertMany(chunk);
+      inserted += result.insertedCount;
+      onProgress?.(inserted, records.length);
+    }
+    return { count: inserted, target: collection };
   } finally {
     await client.close().catch(() => {});
   }
@@ -65,10 +83,11 @@ async function importCsvToMongo({ connectionUrl, dbName, collection, filePath })
 // ──────────────────────────────────────────────────────────────────────────────
 // CSV → PostgreSQL (auto-create TEXT-column table)
 // ──────────────────────────────────────────────────────────────────────────────
-async function importCsvToPostgres({ connectionUrl, table, filePath }) {
+async function importCsvToPostgres({ connectionUrl, table, filePath, onProgress }) {
   const raw = await fs.promises.readFile(filePath, 'utf8');
   const records = csvParse(raw, { columns: true, skip_empty_lines: true, trim: true });
   if (records.length === 0) return { count: 0, target: table };
+  onProgress?.(0, records.length);
 
   const columns = Object.keys(records[0]);
   for (const col of columns) {
@@ -104,6 +123,7 @@ async function importCsvToPostgres({ connectionUrl, table, filePath }) {
         values
       );
       inserted += chunk.length;
+      onProgress?.(inserted, records.length);
     }
     return { count: inserted, target: table };
   } finally {
@@ -174,7 +194,7 @@ async function importPgDumpSql({ containerName, pgUser, pgPassword, pgDbName, fi
 // ──────────────────────────────────────────────────────────────────────────────
 // Dispatcher
 // ──────────────────────────────────────────────────────────────────────────────
-async function dispatchImport({ db, credentials, connectionUrl, containerName, file, queryTarget }) {
+async function dispatchImport({ db, credentials, connectionUrl, containerName, file, queryTarget, onProgress }) {
   const ext = path.extname(file.originalname).toLowerCase();
   const fallback = ext === '.sql' ? 'sql_import' : 'import';
   const target = (queryTarget && validIdent(queryTarget))
@@ -189,21 +209,22 @@ async function dispatchImport({ db, credentials, connectionUrl, containerName, f
     case '.json':
       if (db.type !== 'nosql') throw Object.assign(new Error('.json imports require a NoSQL database'), { status: 400 });
       return { kind: 'json→mongo', ...await importJsonToMongo({
-        connectionUrl, dbName: db.dbName, collection: target, filePath: file.path,
+        connectionUrl, dbName: db.dbName, collection: target, filePath: file.path, onProgress,
       }) };
 
     case '.csv':
       if (db.type === 'nosql') {
         return { kind: 'csv→mongo', ...await importCsvToMongo({
-          connectionUrl, dbName: db.dbName, collection: target, filePath: file.path,
+          connectionUrl, dbName: db.dbName, collection: target, filePath: file.path, onProgress,
         }) };
       }
       return { kind: 'csv→postgres', ...await importCsvToPostgres({
-        connectionUrl, table: target, filePath: file.path,
+        connectionUrl, table: target, filePath: file.path, onProgress,
       }) };
 
     case '.zip':
       if (db.type !== 'nosql') throw Object.assign(new Error('.zip mongodump imports require a NoSQL database'), { status: 400 });
+      onProgress?.(0, null); // archive restores don't expose a row count up front
       return { kind: 'mongodump→mongo', ...await importMongodumpZip({
         containerName,
         mongoUser: credentials.username,
@@ -214,6 +235,7 @@ async function dispatchImport({ db, credentials, connectionUrl, containerName, f
 
     case '.sql':
       if (db.type !== 'sql') throw Object.assign(new Error('.sql pg_dump imports require a SQL database'), { status: 400 });
+      onProgress?.(0, null);
       return { kind: 'pg_dump→postgres', ...await importPgDumpSql({
         containerName,
         pgUser: credentials.username,

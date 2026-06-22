@@ -3,13 +3,84 @@
 @tailwind utilities;
 
 :root {
-  color-scheme: light;
+  color-scheme: dark;
 }
 
 html, body {
   height: 100%;
+  background-color: #0A0A0A;
 }
 
 body {
-  @apply bg-slate-50 text-slate-900;
+  @apply bg-bg-base text-text-primary font-sans antialiased;
+  font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
+}
+
+/* Dark options for native select dropdowns */
+select option {
+  background-color: #1A1A1A;
+  color: #F1F0ED;
+}
+
+/* Tailwind doesn't generate `text-text-primary` etc. for outline-color; this
+   makes focus rings visible everywhere. */
+*:focus-visible {
+  outline: 2px solid #5B6AF0;
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* Scrollbars — slim, dark, only visible on hover */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.06);
+  border-radius: 6px;
+  border: 2px solid #0A0A0A;
+}
+::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.14); }
+
+/* Disable scale animations for reduced-motion users */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+    transition-delay: 0ms !important;
+  }
+}
+
+/* Utility: tiny pulsing dot for "active now" indicators */
+.live-dot {
+  position: relative;
+  width: 8px;
+  height: 8px;
+  border-radius: 9999px;
+  background-color: #22C55E;
+}
+.live-dot::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: 9999px;
+  background-color: #22C55E;
+  opacity: 0.6;
+  animation: live-pulse 2s ease-out infinite;
+}
+@keyframes live-pulse {
+  0%   { transform: scale(1);   opacity: 0.6; }
+  100% { transform: scale(2.4); opacity: 0; }
+}
+
+/* Skeleton loader — sliding shimmer, not a flat opacity pulse */
+.skeleton-shimmer {
+  background: linear-gradient(90deg, #161616 0%, #1f1f1f 50%, #161616 100%);
+  background-size: 800px 100%;
+  animation: skeleton-shimmer 1.4s linear infinite;
+}
+@keyframes skeleton-shimmer {
+  0%   { background-position: -400px 0; }
+  100% { background-position: 400px 0; }
 }

@@ -1,6 +1,6 @@
 import './globals.css';
-import { AuthProvider } from '@/lib/auth';
-import Nav from '@/components/Nav';
+import { inter, jetbrainsMono } from '@/lib/fonts';
+import Providers from '@/components/app/Providers';
 
 export const metadata = {
   title: 'CustomDB',
@@ -9,12 +9,9 @@ export const metadata = {
 
 export default function RootLayout({ children }) {
   return (
-    <html lang="en">
+    <html lang="en" className={`${inter.variable} ${jetbrainsMono.variable}`}>
       <body>
-        <AuthProvider>
-          <Nav />
-          <main className="mx-auto max-w-5xl px-6 py-8">{children}</main>
-        </AuthProvider>
+        <Providers>{children}</Providers>
       </body>
     </html>
   );

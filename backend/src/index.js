@@ -6,6 +6,7 @@ const morgan = require('morgan');
 const prisma = require('./prisma');
 
 const app = express();
+app.set('trust proxy', 1);
 
 app.use(cors({
   origin: process.env.FRONTEND_ORIGIN || 'http://localhost:3000',
@@ -29,7 +30,7 @@ app.get('/health', async (req, res) => {
   }
 });
 
-app.use('/api/auth', require('./routes/auth'));
+app.use('/api/auth', require('./routes/auth').router);
 app.use('/api/databases', require('./routes/databases'));
 
 app.use((err, req, res, _next) => {
@@ -40,13 +41,36 @@ app.use((err, req, res, _next) => {
 async function bootstrap() {
   const { ensureNetwork } = require('./services/dockerNetwork');
   const { syncFromDatabaseRows, reloadNginx } = require('./services/nginxManager');
+  const { ensureContainerRunning } = require('./services/provisioning');
+  const { decrypt } = require('./services/crypto');
   try {
     await ensureNetwork();
+
     const rows = await prisma.database.findMany({
       where: { status: { not: 'deleted' } },
-      select: { port: true, type: true, routing: true, containerName: true },
+      include: { credentials: true },
     });
-    const n = await syncFromDatabaseRows(rows);
+
+    // Dockerode-created DB containers live outside Coolify's compose lifecycle
+    // (only the 4 compose-declared services are tracked), so they don't come
+    // back on their own after a host reboot or stack rebuild. Reconcile every
+    // active DB's container on every boot.
+    for (const db of rows) {
+      if (db.status !== 'active') continue;
+      try {
+        const cred = db.credentials[0];
+        if (!cred) continue;
+        const password = decrypt(cred.passwordEncrypted);
+        const action = await ensureContainerRunning({ db, username: cred.username, password });
+        if (action !== 'running') console.log(`[bootstrap] ${db.dbName}: container ${action}`);
+      } catch (err) {
+        console.error(`[bootstrap] failed to reconcile ${db.dbName}:`, err.message);
+      }
+    }
+
+    const n = await syncFromDatabaseRows(rows.map((r) => ({
+      port: r.port, type: r.type, routing: r.routing, containerName: r.containerName,
+    })));
     if (n > 0) await reloadNginx();
     console.log(`[bootstrap] synced ${n} nginx stream blocks`);
   } catch (err) {

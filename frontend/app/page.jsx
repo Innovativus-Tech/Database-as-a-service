@@ -13,5 +13,5 @@ export default function Home() {
     router.replace(email ? '/dashboard' : '/login');
   }, [email, loading, router]);
 
-  return <p className="text-slate-500">Redirecting...</p>;
+  return <p className="text-text-secondary">Redirecting...</p>;
 }

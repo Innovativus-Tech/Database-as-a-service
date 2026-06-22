@@ -13,17 +13,25 @@ const {
   createPostgresContainer,
   stopAndRemoveContainer,
   inspectContainer,
+  ensureContainerRunning,
+  resolveNames,
   getDirectorySize,
   removeDataDir,
   deriveNames,
 } = require('../services/provisioning');
 const { dispatchImport } = require('../services/dataImport');
+const { createJob: createImportJob, getJob: getImportJob, updateJob: updateImportJob, scheduleCleanup: scheduleImportJobCleanup } = require('../services/importJobs');
+const { FREE_DB_LIMIT } = require('./auth');
 const { addStreamBlock, removeStreamBlock, reloadNginx } = require('../services/nginxManager');
 const {
   listMongoCollections,
   browseMongoCollection,
+  updateMongoDocument,
+  deleteMongoDocument,
   listPostgresTables,
   browsePostgresTable,
+  updatePostgresRow,
+  deletePostgresRow,
 } = require('../services/dataBrowser');
 
 const upload = multer({
@@ -75,15 +83,6 @@ function publicShape(db) {
   };
 }
 
-// For DBs created before the per-user naming change, containerName is null;
-// fall back to the legacy derivation that uses only dbName.
-function resolveNames(db) {
-  if (db.containerName) {
-    return deriveNames({ type: db.type, dbName: db.dbName, userId: db.userId });
-  }
-  return deriveNames({ type: db.type, dbName: db.dbName });
-}
-
 // ──────────────────────────────────────────────────────────────────────────────
 // POST /api/databases/create
 // ──────────────────────────────────────────────────────────────────────────────
@@ -96,6 +95,13 @@ router.post('/create', requireAuth, async (req, res, next) => {
   });
   if (existing && existing.status !== 'deleted') {
     return res.status(409).json({ error: 'You already have a database with that name' });
+  }
+
+  const ownedCount = await prisma.database.count({
+    where: { userId: req.user.id, status: { not: 'deleted' } },
+  });
+  if (ownedCount >= FREE_DB_LIMIT) {
+    return res.status(403).json({ error: `Free tier is limited to ${FREE_DB_LIMIT} databases. Delete one first.` });
   }
 
   const port = await getNextAvailablePort(type);
@@ -247,6 +253,36 @@ router.get('/:id/stats', requireAuth, async (req, res, next) => {
   }
 });
 
+// ──────────────────────────────────────────────────────────────────────────────
+// POST /api/databases/:id/start  — bring the DB's container back up if it's
+// stopped or was removed entirely (host reboot, manual `docker rm`, etc).
+// ──────────────────────────────────────────────────────────────────────────────
+router.post('/:id/start', requireAuth, async (req, res, next) => {
+  if (!validIdOr404(req, res)) return;
+  try {
+    const db = await prisma.database.findFirst({
+      where: { id: req.params.id, userId: req.user.id, status: 'active' },
+      include: { credentials: true },
+    });
+    if (!db) return res.status(404).json({ error: 'Database not found or not active' });
+
+    const cred = db.credentials[0];
+    const password = decrypt(cred.passwordEncrypted);
+    const action = await ensureContainerRunning({ db, username: cred.username, password });
+
+    if (db.routing === 'nginx' && db.containerName) {
+      const internalPort = db.type === 'nosql' ? 27017 : 5432;
+      await addStreamBlock({ port: db.port, containerName: db.containerName, internalPort });
+      await reloadNginx();
+    }
+
+    res.json({ ok: true, action });
+  } catch (err) {
+    console.error('[databases/:id/start]', err);
+    res.status(500).json({ error: err.message || 'Failed to start container' });
+  }
+});
+
 // Helper: load DB with creds, build BOTH a public connection URL (what we hand
 // to the user, points at VPS_HOST:nginx-port) and an internal one (used by the
 // backend's own MongoDB / PG drivers — they run inside the backend container
@@ -337,6 +373,61 @@ router.get('/:id/collections/:name', requireAuth, async (req, res, next) => {
 });
 
 // ──────────────────────────────────────────────────────────────────────────────
+// PUT/DELETE /api/databases/:id/collections/:name/:docId
+//   Mongo: :docId is the document's _id (hex ObjectId or raw string).
+//   Postgres: :docId is the row's `ctid` (returned as __ctid by the browse
+//   endpoint) — most imported tables have no declared primary key.
+// ──────────────────────────────────────────────────────────────────────────────
+router.put('/:id/collections/:name/:docId', requireAuth, async (req, res, next) => {
+  if (!validIdOr404(req, res)) return;
+  try {
+    const loaded = await loadDatabaseWithUrl(req.user.id, req.params.id);
+    if (!loaded) return res.status(404).json({ error: 'Database not found or not active' });
+    const { db, internalUrl } = loaded;
+    const collection = req.params.name;
+
+    if (db.type === 'nosql') {
+      if (typeof req.body !== 'object' || req.body === null) {
+        return res.status(400).json({ error: 'Body must be a JSON object' });
+      }
+      await updateMongoDocument({
+        connectionUrl: internalUrl, dbName: db.dbName, collection, id: req.params.docId, doc: req.body,
+      });
+    } else {
+      const values = req.body?.values;
+      if (!values || typeof values !== 'object') {
+        return res.status(400).json({ error: 'Body must be { values: { col: val, ... } }' });
+      }
+      await updatePostgresRow({ connectionUrl: internalUrl, table: collection, ctid: req.params.docId, values });
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    const status = err.status || 500;
+    res.status(status).json({ error: err.message || 'Failed to update document' });
+  }
+});
+
+router.delete('/:id/collections/:name/:docId', requireAuth, async (req, res, next) => {
+  if (!validIdOr404(req, res)) return;
+  try {
+    const loaded = await loadDatabaseWithUrl(req.user.id, req.params.id);
+    if (!loaded) return res.status(404).json({ error: 'Database not found or not active' });
+    const { db, internalUrl } = loaded;
+    const collection = req.params.name;
+
+    if (db.type === 'nosql') {
+      await deleteMongoDocument({ connectionUrl: internalUrl, dbName: db.dbName, collection, id: req.params.docId });
+    } else {
+      await deletePostgresRow({ connectionUrl: internalUrl, table: collection, ctid: req.params.docId });
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    const status = err.status || 500;
+    res.status(status).json({ error: err.message || 'Failed to delete document' });
+  }
+});
+
+// ──────────────────────────────────────────────────────────────────────────────
 // POST /api/databases/:id/import  — multipart file upload, dispatches by ext
 //   .json  → mongo insertMany
 //   .csv   → mongo insertMany or pg auto-table
@@ -344,6 +435,9 @@ router.get('/:id/collections/:name', requireAuth, async (req, res, next) => {
 //   .sql   → psql
 // Query: ?target=name (collection or table). Defaults to filename stem.
 // ──────────────────────────────────────────────────────────────────────────────
+// Starts the import in the background and returns a jobId immediately —
+// the dashboard polls /:id/import/:jobId/status for real progress instead of
+// blocking on one long request (imports of large files can take minutes).
 router.post('/:id/import', requireAuth, upload.single('file'), async (req, res, next) => {
   if (!validIdOr404(req, res)) {
     if (req.file) fs.promises.unlink(req.file.path).catch(() => {});
@@ -383,23 +477,51 @@ router.post('/:id/import', requireAuth, upload.single('file'), async (req, res, 
       });
     }
 
-    const result = await dispatchImport({
+    const jobId = createImportJob();
+    const file = req.file;
+    const queryTarget = typeof req.query.target === 'string' ? req.query.target : undefined;
+
+    // Deliberately not awaited — this runs after the response is sent.
+    dispatchImport({
       db,
       credentials: { username: cred.username, password },
       connectionUrl,
       containerName,
-      file: req.file,
-      queryTarget: typeof req.query.target === 'string' ? req.query.target : undefined,
-    });
+      file,
+      queryTarget,
+      onProgress: (processed, total) => updateImportJob(jobId, { processed, total }),
+    })
+      .then((result) => {
+        updateImportJob(jobId, { status: 'done', result: { file: file.originalname, ...result } });
+      })
+      .catch((err) => {
+        console.error('[databases/:id/import]', err);
+        updateImportJob(jobId, { status: 'error', error: err.message || 'Import failed' });
+      })
+      .finally(() => {
+        fs.promises.unlink(file.path).catch(() => {});
+        scheduleImportJobCleanup(jobId);
+      });
 
-    res.json({ ok: true, file: req.file.originalname, ...result });
+    res.status(202).json({ ok: true, jobId });
   } catch (err) {
-    const status = err.status || 500;
-    console.error('[databases/:id/import]', err);
-    res.status(status).json({ error: err.message || 'Import failed' });
-  } finally {
     if (req.file?.path) fs.promises.unlink(req.file.path).catch(() => {});
+    next(err);
   }
+});
+
+router.get('/:id/import/:jobId/status', requireAuth, async (req, res) => {
+  if (!validIdOr404(req, res)) return;
+  const job = getImportJob(req.params.jobId);
+  if (!job) return res.status(404).json({ error: 'Import job not found or expired' });
+  res.json({
+    status: job.status,
+    processed: job.processed,
+    total: job.total,
+    elapsedMs: Date.now() - job.startedAt,
+    result: job.status === 'done' ? job.result : undefined,
+    error: job.status === 'error' ? job.error : undefined,
+  });
 });
 
 // ──────────────────────────────────────────────────────────────────────────────

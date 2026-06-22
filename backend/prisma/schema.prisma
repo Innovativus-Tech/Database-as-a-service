@@ -31,15 +31,36 @@ enum DatabaseStatus {
 }
 
 model User {
-  id           String     @id @default(uuid()) @db.Uuid
-  email        String     @unique
-  passwordHash String
-  plan         Plan       @default(free)
-  createdAt    DateTime   @default(now())
+  id               String     @id @default(uuid()) @db.Uuid
+  email            String     @unique
+  passwordHash     String
+  plan             Plan       @default(free)
+  displayName      String?
+  avatarUrl        String?
+  twoFactorSecret  String?
+  twoFactorEnabled Boolean    @default(false)
+  createdAt        DateTime   @default(now())
 
-  databases    Database[]
+  databases Database[]
+  sessions  Session[]
 
   @@map("users")
+}
+
+model Session {
+  id         String    @id @default(uuid()) @db.Uuid
+  userId     String    @db.Uuid
+  jti        String    @unique
+  userAgent  String?
+  ip         String?
+  createdAt  DateTime  @default(now())
+  lastSeenAt DateTime  @default(now())
+  revokedAt  DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("sessions")
 }
 
 model Database {

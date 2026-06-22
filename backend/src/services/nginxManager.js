@@ -18,10 +18,17 @@ function configPath(port) {
 }
 
 function blockText({ port, containerName, internalPort }) {
+  // proxy_pass target MUST live in a variable, not a bare literal — nginx
+  // resolves a literal hostname once at config-load time, and if that one
+  // container is down, the whole nginx process fails to start/reload,
+  // breaking routing for every other database. Holding it in a variable
+  // defers resolution to connection time via the `resolver` directive, so a
+  // single dead container only breaks its own route.
   return `# customdb stream block for port ${port}
 server {
   listen ${port};
-  proxy_pass ${containerName}:${internalPort};
+  set $upstream_${port} ${containerName};
+  proxy_pass $upstream_${port}:${internalPort};
   proxy_connect_timeout 5s;
   proxy_timeout 1h;
 }

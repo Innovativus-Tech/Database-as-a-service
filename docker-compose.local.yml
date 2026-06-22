@@ -1,0 +1,41 @@
+# Local override — use with:
+#   docker compose -f docker-compose.yml -f docker-compose.local.yml up --build
+#
+# What this fixes for local development:
+#  1. Removes the `coolify` external network (doesn't exist locally).
+#  2. Publishes the backend port so the browser / curl can reach it.
+#  3. Replaces the hardcoded /data host bind-mount with a local ./data directory.
+
+services:
+  backend:
+    environment:
+      NODE_ENV: development
+      FRONTEND_ORIGIN: http://localhost:3030
+      VPS_HOST: localhost
+      NGINX_STREAM_DIR: /etc/nginx/stream.d
+    ports:
+      - "4000:4000"
+    volumes:
+      - ./data:/data
+      - ./nginx/stream.d:/etc/nginx/stream.d
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - customdb-network
+
+  frontend:
+    build:
+      args:
+        NEXT_PUBLIC_API_URL: http://localhost:4000
+
+  nginx:
+    networks:
+      - customdb-network
+
+networks:
+  # Remove the coolify network — it only exists on Coolify-managed VPS hosts.
+  # Redefine it as a plain local bridge so docker compose doesn't try to find
+  # an external network that doesn't exist on this machine.
+  coolify:
+    external: false
+    name: customdb-coolify-local
+    driver: bridge

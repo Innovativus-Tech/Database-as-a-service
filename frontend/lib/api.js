@@ -47,12 +47,25 @@ async function request(path, { method = 'GET', body, formData, headers = {} } = 
 
 export const api = {
   signup: (email, password) => request('/api/auth/signup', { method: 'POST', body: { email, password } }),
-  login:  (email, password) => request('/api/auth/login',  { method: 'POST', body: { email, password } }),
+  login:  (email, password, totp) => request('/api/auth/login',  { method: 'POST', body: { email, password, ...(totp ? { totp } : {}) } }),
   me:     () => request('/api/auth/me'),
+  updateProfile:  (data) => request('/api/auth/me', { method: 'PATCH', body: data }),
+  changePassword: (data) => request('/api/auth/password', { method: 'POST', body: data }),
+  deleteAccount:  () => request('/api/auth/me', { method: 'DELETE', body: { confirm: 'CONFIRM' } }),
+  getUsage: () => request('/api/auth/usage'),
+
+  getSessions:   () => request('/api/auth/sessions'),
+  revokeSession: (id) => request(`/api/auth/sessions/${id}`, { method: 'DELETE' }),
+
+  setup2FA:   () => request('/api/auth/2fa/setup', { method: 'POST' }),
+  verify2FA:  (code) => request('/api/auth/2fa/verify', { method: 'POST', body: { code } }),
+  disable2FA: (code) => request('/api/auth/2fa/disable', { method: 'POST', body: { code } }),
+
   listDatabases:  () => request('/api/databases'),
   getDatabase:    (id) => request(`/api/databases/${id}`),
   getStats:       (id) => request(`/api/databases/${id}/stats`),
   createDatabase: (name, type) => request('/api/databases/create', { method: 'POST', body: { name, type } }),
+  startDatabase:  (id) => request(`/api/databases/${id}/start`, { method: 'POST' }),
   deleteDatabase: (id) => request(`/api/databases/${id}`, { method: 'DELETE' }),
   importFile:     (id, file, target) => {
     const fd = new FormData();
@@ -60,10 +73,15 @@ export const api = {
     const qs = target ? `?target=${encodeURIComponent(target)}` : '';
     return request(`/api/databases/${id}/import${qs}`, { method: 'POST', formData: fd });
   },
+  getImportJobStatus: (id, jobId) => request(`/api/databases/${id}/import/${jobId}/status`),
   listCollections: (id) => request(`/api/databases/${id}/collections`),
   browseCollection: (id, name, { skip = 0, limit = 50, filter } = {}) => {
     const params = new URLSearchParams({ skip: String(skip), limit: String(limit) });
     if (filter) params.set('filter', filter);
     return request(`/api/databases/${id}/collections/${encodeURIComponent(name)}?${params}`);
   },
+  updateDocument: (id, name, docId, payload) =>
+    request(`/api/databases/${id}/collections/${encodeURIComponent(name)}/${encodeURIComponent(docId)}`, { method: 'PUT', body: payload }),
+  deleteDocument: (id, name, docId) =>
+    request(`/api/databases/${id}/collections/${encodeURIComponent(name)}/${encodeURIComponent(docId)}`, { method: 'DELETE' }),
 };

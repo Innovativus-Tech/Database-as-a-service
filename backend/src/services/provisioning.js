@@ -159,6 +159,45 @@ async function inspectContainer(name) {
   }
 }
 
+async function startContainer(name) {
+  const container = docker.getContainer(name);
+  try {
+    await container.start();
+  } catch (err) {
+    if (err.statusCode === 304) return; // already running
+    throw err;
+  }
+}
+
+// For DBs created before the per-user naming change, containerName is null;
+// fall back to the legacy derivation that uses only dbName.
+function resolveNames(db) {
+  if (db.containerName) {
+    return deriveNames({ type: db.type, dbName: db.dbName, userId: db.userId });
+  }
+  return deriveNames({ type: db.type, dbName: db.dbName });
+}
+
+// Make sure an active DB's container is actually up. Containers can disappear
+// entirely (e.g. host reboot, manual `docker rm`, stack rebuild) since they're
+// created by Dockerode outside Coolify's compose lifecycle and won't come back
+// on their own. Their data dir is a host bind mount, not a named volume, so
+// it survives container removal and recreating the container reattaches it.
+async function ensureContainerRunning({ db, username, password }) {
+  const { containerName: name } = resolveNames(db);
+  const inspect = await inspectContainer(name);
+  if (!inspect) {
+    const fn = db.type === 'nosql' ? createMongoContainer : createPostgresContainer;
+    await fn({ userId: db.userId, dbName: db.dbName, port: db.port, username, password, routing: db.routing || 'nginx' });
+    return 'recreated';
+  }
+  if (!inspect.State.Running) {
+    await startContainer(name);
+    return 'started';
+  }
+  return 'running';
+}
+
 async function getDirectorySize(dir) {
   let total = 0;
   let entries;
@@ -199,6 +238,9 @@ module.exports = {
   createPostgresContainer,
   stopAndRemoveContainer,
   inspectContainer,
+  startContainer,
+  ensureContainerRunning,
+  resolveNames,
   getDirectorySize,
   removeDataDir,
   deriveNames,

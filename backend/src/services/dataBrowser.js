@@ -1,4 +1,4 @@
-const { MongoClient } = require('mongodb');
+const { MongoClient, ObjectId } = require('mongodb');
 const { Client: PgClient } = require('pg');
 
 // MongoDB ──────────────────────────────────────────────────────────────────────
@@ -35,6 +35,33 @@ async function browseMongoCollection({ connectionUrl, dbName, collection, skip =
       col.countDocuments(filter),
     ]);
     return { total, skip, limit, rows };
+  });
+}
+
+function toMongoId(id) {
+  if (typeof id === 'string' && ObjectId.isValid(id) && String(new ObjectId(id)) === id) {
+    return new ObjectId(id);
+  }
+  return id; // _id wasn't an ObjectId hex string — fall back to the raw value
+}
+
+async function updateMongoDocument({ connectionUrl, dbName, collection, id, doc }) {
+  return withMongo(connectionUrl, async (client) => {
+    const { _id, ...rest } = doc || {};
+    const result = await client.db(dbName).collection(collection).updateOne(
+      { _id: toMongoId(id) },
+      { $set: rest }
+    );
+    if (result.matchedCount === 0) throw Object.assign(new Error('Document not found'), { status: 404 });
+    return { ok: true };
+  });
+}
+
+async function deleteMongoDocument({ connectionUrl, dbName, collection, id }) {
+  return withMongo(connectionUrl, async (client) => {
+    const result = await client.db(dbName).collection(collection).deleteOne({ _id: toMongoId(id) });
+    if (result.deletedCount === 0) throw Object.assign(new Error('Document not found'), { status: 404 });
+    return { ok: true };
   });
 }
 
@@ -99,17 +126,61 @@ async function browsePostgresTable({ connectionUrl, table, skip = 0, limit = 50 
     const countRes = await client.query(`SELECT COUNT(*)::bigint AS c FROM "${table}"`);
     const total = Number(countRes.rows[0].c);
 
+    // ctid (physical row id) lets the client edit/delete a specific row even
+    // though most tables here have no declared primary key. It's only stable
+    // for the lifetime of this page load (an UPDATE/VACUUM can change it).
     const rowsRes = await client.query(
-      `SELECT * FROM "${table}" LIMIT $1 OFFSET $2`,
+      `SELECT *, ctid::text AS "__ctid" FROM "${table}" LIMIT $1 OFFSET $2`,
       [Math.min(limit, 500), skip]
     );
     return { total, skip, limit, columns, rows: rowsRes.rows };
   });
 }
 
+async function updatePostgresRow({ connectionUrl, table, ctid, values }) {
+  if (!validIdent(table)) {
+    throw Object.assign(new Error('Invalid table name'), { status: 400 });
+  }
+  return withPg(connectionUrl, async (client) => {
+    const colsRes = await client.query(
+      `SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name=$1`,
+      [table]
+    );
+    const validCols = new Set(colsRes.rows.map((r) => r.column_name));
+    const setCols = Object.keys(values || {}).filter((c) => validCols.has(c));
+    if (setCols.length === 0) {
+      throw Object.assign(new Error('No valid columns to update'), { status: 400 });
+    }
+    const setSql = setCols.map((c, i) => `"${c}" = $${i + 1}`).join(', ');
+    const params = setCols.map((c) => values[c]);
+    params.push(ctid);
+    const result = await client.query(
+      `UPDATE "${table}" SET ${setSql} WHERE ctid = $${params.length}::tid`,
+      params
+    );
+    if (result.rowCount === 0) throw Object.assign(new Error('Row not found'), { status: 404 });
+    return { ok: true };
+  });
+}
+
+async function deletePostgresRow({ connectionUrl, table, ctid }) {
+  if (!validIdent(table)) {
+    throw Object.assign(new Error('Invalid table name'), { status: 400 });
+  }
+  return withPg(connectionUrl, async (client) => {
+    const result = await client.query(`DELETE FROM "${table}" WHERE ctid = $1::tid`, [ctid]);
+    if (result.rowCount === 0) throw Object.assign(new Error('Row not found'), { status: 404 });
+    return { ok: true };
+  });
+}
+
 module.exports = {
   listMongoCollections,
   browseMongoCollection,
+  updateMongoDocument,
+  deleteMongoDocument,
   listPostgresTables,
   browsePostgresTable,
+  updatePostgresRow,
+  deletePostgresRow,
 };
