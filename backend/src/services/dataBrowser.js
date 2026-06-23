@@ -65,6 +65,24 @@ async function deleteMongoDocument({ connectionUrl, dbName, collection, id }) {
   });
 }
 
+async function createMongoCollection(connectionUrl, dbName, name) {
+  return withMongo(connectionUrl, async (client) => {
+    await client.db(dbName).createCollection(name);
+    return { ok: true };
+  });
+}
+
+async function dropMongoCollection(connectionUrl, dbName, name) {
+  return withMongo(connectionUrl, async (client) => {
+    try {
+      await client.db(dbName).collection(name).drop();
+    } catch (err) {
+      if (err.codeName !== 'NamespaceNotFound') throw err;
+    }
+    return { ok: true };
+  });
+}
+
 // PostgreSQL ──────────────────────────────────────────────────────────────────
 
 const PG_IDENT_RE = /^[a-zA-Z_][a-zA-Z0-9_]{0,62}$/;
@@ -174,13 +192,48 @@ async function deletePostgresRow({ connectionUrl, table, ctid }) {
   });
 }
 
+const PG_COLUMN_TYPES = new Set(['text', 'integer', 'bigint', 'boolean', 'timestamptz', 'numeric', 'double precision', 'jsonb']);
+
+async function createPostgresTable({ connectionUrl, table, columns }) {
+  if (!validIdent(table)) {
+    throw Object.assign(new Error('Invalid table name'), { status: 400 });
+  }
+  if (!Array.isArray(columns) || columns.length === 0) {
+    throw Object.assign(new Error('At least one column is required'), { status: 400 });
+  }
+  const defs = columns.map((c) => {
+    if (!validIdent(c.name)) throw Object.assign(new Error(`Invalid column name: ${c.name}`), { status: 400 });
+    if (!PG_COLUMN_TYPES.has(c.type)) throw Object.assign(new Error(`Invalid column type: ${c.type}`), { status: 400 });
+    return `"${c.name}" ${c.type}`;
+  });
+  return withPg(connectionUrl, async (client) => {
+    await client.query(`CREATE TABLE "${table}" (${defs.join(', ')})`);
+    return { ok: true };
+  });
+}
+
+async function dropPostgresTable({ connectionUrl, table }) {
+  if (!validIdent(table)) {
+    throw Object.assign(new Error('Invalid table name'), { status: 400 });
+  }
+  return withPg(connectionUrl, async (client) => {
+    await client.query(`DROP TABLE IF EXISTS "${table}"`);
+    return { ok: true };
+  });
+}
+
 module.exports = {
   listMongoCollections,
   browseMongoCollection,
   updateMongoDocument,
   deleteMongoDocument,
+  createMongoCollection,
+  dropMongoCollection,
   listPostgresTables,
   browsePostgresTable,
   updatePostgresRow,
   deletePostgresRow,
+  createPostgresTable,
+  dropPostgresTable,
+  PG_COLUMN_TYPES,
 };

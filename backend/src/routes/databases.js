@@ -28,10 +28,15 @@ const {
   browseMongoCollection,
   updateMongoDocument,
   deleteMongoDocument,
+  createMongoCollection,
+  dropMongoCollection,
   listPostgresTables,
   browsePostgresTable,
   updatePostgresRow,
   deletePostgresRow,
+  createPostgresTable,
+  dropPostgresTable,
+  PG_COLUMN_TYPES,
 } = require('../services/dataBrowser');
 
 const upload = multer({
@@ -178,6 +183,14 @@ router.get('/', requireAuth, async (req, res, next) => {
   } catch (err) {
     next(err);
   }
+});
+
+// ──────────────────────────────────────────────────────────────────────────────
+// GET /api/databases/columnTypes — allowed Postgres column types for the create-table form
+// Registered before /:id so "columnTypes" isn't swallowed as a database id.
+// ──────────────────────────────────────────────────────────────────────────────
+router.get('/columnTypes', requireAuth, (req, res) => {
+  res.json({ types: [...PG_COLUMN_TYPES] });
 });
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -335,6 +348,57 @@ router.get('/:id/collections', requireAuth, async (req, res, next) => {
   } catch (err) {
     const status = err.status || 500;
     res.status(status).json({ error: err.message || 'Failed to list collections' });
+  }
+});
+
+// ──────────────────────────────────────────────────────────────────────────────
+// POST /api/databases/:id/collections — create an empty collection/table
+//   Mongo body: { name }
+//   Postgres body: { name, columns: [{ name, type }] }  (type from PG_COLUMN_TYPES)
+// ──────────────────────────────────────────────────────────────────────────────
+router.post('/:id/collections', requireAuth, async (req, res, next) => {
+  if (!validIdOr404(req, res)) return;
+  try {
+    const loaded = await loadDatabaseWithUrl(req.user.id, req.params.id);
+    if (!loaded) return res.status(404).json({ error: 'Database not found or not active' });
+    const { db, internalUrl } = loaded;
+    const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+    if (!DB_NAME_RE.test(name)) {
+      return res.status(400).json({ error: 'Name must be 3-40 chars, start with a letter, and contain only letters/numbers/_/-' });
+    }
+
+    if (db.type === 'nosql') {
+      await createMongoCollection(internalUrl, db.dbName, name);
+    } else {
+      await createPostgresTable({ connectionUrl: internalUrl, table: name, columns: req.body?.columns });
+    }
+    res.status(201).json({ ok: true, name });
+  } catch (err) {
+    const status = err.status || 500;
+    res.status(status).json({ error: err.message || 'Failed to create collection' });
+  }
+});
+
+// ──────────────────────────────────────────────────────────────────────────────
+// DELETE /api/databases/:id/collections/:name — drop an entire collection/table
+// ──────────────────────────────────────────────────────────────────────────────
+router.delete('/:id/collections/:name', requireAuth, async (req, res, next) => {
+  if (!validIdOr404(req, res)) return;
+  try {
+    const loaded = await loadDatabaseWithUrl(req.user.id, req.params.id);
+    if (!loaded) return res.status(404).json({ error: 'Database not found or not active' });
+    const { db, internalUrl } = loaded;
+    const collection = req.params.name;
+
+    if (db.type === 'nosql') {
+      await dropMongoCollection(internalUrl, db.dbName, collection);
+    } else {
+      await dropPostgresTable({ connectionUrl: internalUrl, table: collection });
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    const status = err.status || 500;
+    res.status(status).json({ error: err.message || 'Failed to drop collection' });
   }
 });
 

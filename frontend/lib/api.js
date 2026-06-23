@@ -75,6 +75,9 @@ export const api = {
   },
   getImportJobStatus: (id, jobId) => request(`/api/databases/${id}/import/${jobId}/status`),
   listCollections: (id) => request(`/api/databases/${id}/collections`),
+  createCollection: (id, payload) => request(`/api/databases/${id}/collections`, { method: 'POST', body: payload }),
+  dropCollection: (id, name) => request(`/api/databases/${id}/collections/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+  getColumnTypes: () => request('/api/databases/columnTypes'),
   browseCollection: (id, name, { skip = 0, limit = 50, filter } = {}) => {
     const params = new URLSearchParams({ skip: String(skip), limit: String(limit) });
     if (filter) params.set('filter', filter);
