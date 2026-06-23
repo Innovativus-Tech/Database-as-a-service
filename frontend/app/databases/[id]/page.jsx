@@ -174,7 +174,7 @@ export default function DatabaseDetailPage() {
             {restartBusy ? 'Restarting...' : 'Restart'}
           </button>
           <button
-            onClick={() => setConfirmingDelete(true)}
+            onClick={() => { setActiveTab('Settings'); setConfirmingDelete(true); }}
             className="h-9 px-3.5 border border-danger/30 rounded bg-transparent text-danger text-sm font-medium inline-flex items-center gap-[7px] hover:bg-danger/10 transition-colors"
           >
             <Trash2 className="h-4 w-4" strokeWidth={1.75} />Delete
