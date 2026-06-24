@@ -107,9 +107,13 @@ async function createMongoContainer({ userId, dbName, port, username, password, 
   // never sees.
   const rootUser = `root_${randomToken(6)}`;
   const rootPass = randomToken(24);
+  // The user record itself must live in `admin` (matching the
+  // ?authSource=admin every connection string uses) even though its granted
+  // role only covers `dbName` — authSource has to match whichever database
+  // the user was actually created in, regardless of what that role targets.
   const initFile = path.join(initScriptDir(), `${name}.js`);
   await fs.promises.writeFile(initFile, [
-    `db.getSiblingDB('${dbName}').createUser({`,
+    `db.getSiblingDB('admin').createUser({`,
     `  user: '${username}',`,
     `  pwd: '${password}',`,
     `  roles: [{ role: 'dbOwner', db: '${dbName}' }],`,
