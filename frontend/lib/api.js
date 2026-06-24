@@ -74,17 +74,33 @@ export const api = {
     return request(`/api/databases/${id}/import${qs}`, { method: 'POST', formData: fd });
   },
   getImportJobStatus: (id, jobId) => request(`/api/databases/${id}/import/${jobId}/status`),
-  listCollections: (id) => request(`/api/databases/${id}/collections`),
+
+  listSchemas: (id) => request(`/api/databases/${id}/schemas`),
+  createSchema: (id, payload) => request(`/api/databases/${id}/schemas`, { method: 'POST', body: payload }),
+  dropSchema: (id, name) => request(`/api/databases/${id}/schemas/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+
+  listCollections: (id, schema) => {
+    const qs = schema ? `?schema=${encodeURIComponent(schema)}` : '';
+    return request(`/api/databases/${id}/collections${qs}`);
+  },
   createCollection: (id, payload) => request(`/api/databases/${id}/collections`, { method: 'POST', body: payload }),
-  dropCollection: (id, name) => request(`/api/databases/${id}/collections/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+  dropCollection: (id, name, schema) => {
+    const qs = schema ? `?schema=${encodeURIComponent(schema)}` : '';
+    return request(`/api/databases/${id}/collections/${encodeURIComponent(name)}${qs}`, { method: 'DELETE' });
+  },
   getColumnTypes: () => request('/api/databases/columnTypes'),
-  browseCollection: (id, name, { skip = 0, limit = 50, filter } = {}) => {
+  browseCollection: (id, name, { skip = 0, limit = 50, filter, schema } = {}) => {
     const params = new URLSearchParams({ skip: String(skip), limit: String(limit) });
     if (filter) params.set('filter', filter);
+    if (schema) params.set('schema', schema);
     return request(`/api/databases/${id}/collections/${encodeURIComponent(name)}?${params}`);
   },
-  updateDocument: (id, name, docId, payload) =>
-    request(`/api/databases/${id}/collections/${encodeURIComponent(name)}/${encodeURIComponent(docId)}`, { method: 'PUT', body: payload }),
-  deleteDocument: (id, name, docId) =>
-    request(`/api/databases/${id}/collections/${encodeURIComponent(name)}/${encodeURIComponent(docId)}`, { method: 'DELETE' }),
+  updateDocument: (id, name, docId, payload, schema) =>
+    request(`/api/databases/${id}/collections/${encodeURIComponent(name)}/${encodeURIComponent(docId)}`, {
+      method: 'PUT', body: schema ? { ...payload, schema } : payload,
+    }),
+  deleteDocument: (id, name, docId, schema) => {
+    const qs = schema ? `?schema=${encodeURIComponent(schema)}` : '';
+    return request(`/api/databases/${id}/collections/${encodeURIComponent(name)}/${encodeURIComponent(docId)}${qs}`, { method: 'DELETE' });
+  },
 };

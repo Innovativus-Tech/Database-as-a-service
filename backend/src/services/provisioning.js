@@ -101,22 +101,24 @@ async function createMongoContainer({ userId, dbName, port, username, password, 
   // The root user below is a throwaway bootstrap credential — never stored or
   // handed to the customer. It only exists so Mongo's entrypoint can enable
   // --auth and run the init script once (on a fresh data dir) to create the
-  // customer-facing user scoped to just `dbName` (not root over the whole
-  // container). This is what stops a stray external connection from silently
-  // creating sibling databases (e.g. "public", "defaultdb") that CustomDB
-  // never sees.
+  // customer-facing user. That user gets readWriteAnyDatabase + dbAdminAnyDatabase
+  // (not literal root) — full access to any database WITHIN this one container,
+  // so a customer can self-service multiple Mongo databases ("schema folders")
+  // on one connection, while still being fully isolated from every other
+  // customer's own separate container.
   const rootUser = `root_${randomToken(6)}`;
   const rootPass = randomToken(24);
   // The user record itself must live in `admin` (matching the
-  // ?authSource=admin every connection string uses) even though its granted
-  // role only covers `dbName` — authSource has to match whichever database
-  // the user was actually created in, regardless of what that role targets.
+  // ?authSource=admin every connection string uses).
   const initFile = path.join(initScriptDir(), `${name}.js`);
   await fs.promises.writeFile(initFile, [
     `db.getSiblingDB('admin').createUser({`,
     `  user: '${username}',`,
     `  pwd: '${password}',`,
-    `  roles: [{ role: 'dbOwner', db: '${dbName}' }],`,
+    `  roles: [`,
+    `    { role: 'readWriteAnyDatabase', db: 'admin' },`,
+    `    { role: 'dbAdminAnyDatabase', db: 'admin' },`,
+    `  ],`,
     `});`,
   ].join('\n'));
 

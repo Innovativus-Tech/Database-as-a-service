@@ -25,12 +25,18 @@ const { createJob: createImportJob, getJob: getImportJob, updateJob: updateImpor
 const { FREE_DB_LIMIT } = require('./auth');
 const { addStreamBlock, removeStreamBlock, reloadNginx } = require('../services/nginxManager');
 const {
+  listMongoDatabases,
+  createMongoDatabase,
+  dropMongoDatabase,
   listMongoCollections,
   browseMongoCollection,
   updateMongoDocument,
   deleteMongoDocument,
   createMongoCollection,
   dropMongoCollection,
+  listPostgresSchemas,
+  createPostgresSchema,
+  dropPostgresSchema,
   listPostgresTables,
   browsePostgresTable,
   updatePostgresRow,
@@ -332,33 +338,47 @@ async function loadDatabaseWithUrl(userId, id) {
   return { db, connectionUrl, internalUrl, credentials: { username: cred.username, password } };
 }
 
+// The "schema" a request targets — a Mongo database name or a Postgres schema
+// name. Defaults to this CustomDB database's own primary one (db.dbName for
+// Mongo, "public" for Postgres) so every pre-existing call site that doesn't
+// pass ?schema=/body.schema keeps working unchanged.
+function resolveSchema(req, db) {
+  const requested = typeof req.query.schema === 'string' ? req.query.schema
+    : typeof req.body?.schema === 'string' ? req.body.schema
+    : '';
+  if (requested) return requested;
+  return db.type === 'nosql' ? db.dbName : 'public';
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
-// GET /api/databases/:id/collections  — list collections / tables
+// GET /api/databases/:id/schemas — list Mongo databases / Postgres schemas
+//   available inside this one container.
 // ──────────────────────────────────────────────────────────────────────────────
-router.get('/:id/collections', requireAuth, async (req, res, next) => {
+router.get('/:id/schemas', requireAuth, async (req, res) => {
   if (!validIdOr404(req, res)) return;
   try {
     const loaded = await loadDatabaseWithUrl(req.user.id, req.params.id);
     if (!loaded) return res.status(404).json({ error: 'Database not found or not active' });
     const { db, internalUrl } = loaded;
 
-    const collections = db.type === 'nosql'
-      ? await listMongoCollections(internalUrl, db.dbName)
-      : await listPostgresTables(internalUrl);
+    const schemas = db.type === 'nosql'
+      ? await listMongoDatabases(internalUrl)
+      : await listPostgresSchemas(internalUrl);
 
-    res.json({ collections, type: db.type });
+    res.json({ schemas, type: db.type, primary: db.type === 'nosql' ? db.dbName : 'public' });
   } catch (err) {
     const status = err.status || 500;
-    res.status(status).json({ error: err.message || 'Failed to list collections' });
+    res.status(status).json({ error: err.message || 'Failed to list schemas' });
   }
 });
 
 // ──────────────────────────────────────────────────────────────────────────────
-// POST /api/databases/:id/collections — create an empty collection/table
-//   Mongo body: { name }
-//   Postgres body: { name, columns: [{ name, type }] }  (type from PG_COLUMN_TYPES)
+// POST /api/databases/:id/schemas — create a new Mongo database / Postgres schema
+//   Mongo body: { name, firstCollection } — Mongo only materializes a database
+//   once it has a real collection, so the first one is created in the same step.
+//   Postgres body: { name } — CREATE SCHEMA, genuinely empty until you add tables.
 // ──────────────────────────────────────────────────────────────────────────────
-router.post('/:id/collections', requireAuth, async (req, res, next) => {
+router.post('/:id/schemas', requireAuth, async (req, res) => {
   if (!validIdOr404(req, res)) return;
   try {
     const loaded = await loadDatabaseWithUrl(req.user.id, req.params.id);
@@ -370,9 +390,93 @@ router.post('/:id/collections', requireAuth, async (req, res, next) => {
     }
 
     if (db.type === 'nosql') {
-      await createMongoCollection(internalUrl, db.dbName, name);
+      const firstCollection = typeof req.body?.firstCollection === 'string' ? req.body.firstCollection.trim() : '';
+      if (!DB_NAME_RE.test(firstCollection)) {
+        return res.status(400).json({ error: 'firstCollection must be 3-40 chars, start with a letter, and contain only letters/numbers/_/-' });
+      }
+      await createMongoDatabase(internalUrl, name, firstCollection);
     } else {
-      await createPostgresTable({ connectionUrl: internalUrl, table: name, columns: req.body?.columns });
+      await createPostgresSchema(internalUrl, name);
+    }
+    res.status(201).json({ ok: true, name });
+  } catch (err) {
+    const status = err.status || 500;
+    res.status(status).json({ error: err.message || 'Failed to create schema' });
+  }
+});
+
+// ──────────────────────────────────────────────────────────────────────────────
+// DELETE /api/databases/:id/schemas/:name — drop an entire Mongo database /
+//   Postgres schema, including everything inside it. Cannot drop the
+//   database's own primary schema (Mongo: db.dbName, Postgres: "public").
+// ──────────────────────────────────────────────────────────────────────────────
+router.delete('/:id/schemas/:name', requireAuth, async (req, res) => {
+  if (!validIdOr404(req, res)) return;
+  try {
+    const loaded = await loadDatabaseWithUrl(req.user.id, req.params.id);
+    if (!loaded) return res.status(404).json({ error: 'Database not found or not active' });
+    const { db, internalUrl } = loaded;
+    const name = req.params.name;
+    const primary = db.type === 'nosql' ? db.dbName : 'public';
+    if (name === primary) {
+      return res.status(400).json({ error: `Can't drop the primary schema (${primary})` });
+    }
+
+    if (db.type === 'nosql') {
+      await dropMongoDatabase(internalUrl, name);
+    } else {
+      await dropPostgresSchema(internalUrl, name);
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    const status = err.status || 500;
+    res.status(status).json({ error: err.message || 'Failed to drop schema' });
+  }
+});
+
+// ──────────────────────────────────────────────────────────────────────────────
+// GET /api/databases/:id/collections?schema=  — list collections / tables
+// ──────────────────────────────────────────────────────────────────────────────
+router.get('/:id/collections', requireAuth, async (req, res, next) => {
+  if (!validIdOr404(req, res)) return;
+  try {
+    const loaded = await loadDatabaseWithUrl(req.user.id, req.params.id);
+    if (!loaded) return res.status(404).json({ error: 'Database not found or not active' });
+    const { db, internalUrl } = loaded;
+    const schema = resolveSchema(req, db);
+
+    const collections = db.type === 'nosql'
+      ? await listMongoCollections(internalUrl, schema)
+      : await listPostgresTables({ connectionUrl: internalUrl, schema });
+
+    res.json({ collections, type: db.type, schema });
+  } catch (err) {
+    const status = err.status || 500;
+    res.status(status).json({ error: err.message || 'Failed to list collections' });
+  }
+});
+
+// ──────────────────────────────────────────────────────────────────────────────
+// POST /api/databases/:id/collections — create an empty collection/table
+//   Mongo body: { name, schema }
+//   Postgres body: { name, schema, columns: [{ name, type }] }  (type from PG_COLUMN_TYPES)
+// ──────────────────────────────────────────────────────────────────────────────
+router.post('/:id/collections', requireAuth, async (req, res, next) => {
+  if (!validIdOr404(req, res)) return;
+  try {
+    const loaded = await loadDatabaseWithUrl(req.user.id, req.params.id);
+    if (!loaded) return res.status(404).json({ error: 'Database not found or not active' });
+    const { db, internalUrl } = loaded;
+    const schema = resolveSchema(req, db);
+    const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+    if (!DB_NAME_RE.test(name)) {
+      return res.status(400).json({ error: 'Name must be 3-40 chars, start with a letter, and contain only letters/numbers/_/-' });
+    }
+
+    if (db.type === 'nosql') {
+      await createMongoCollection(internalUrl, schema, name);
+    } else {
+      await createPostgresTable({ connectionUrl: internalUrl, schema, table: name, columns: req.body?.columns });
     }
     res.status(201).json({ ok: true, name });
   } catch (err) {
@@ -382,7 +486,7 @@ router.post('/:id/collections', requireAuth, async (req, res, next) => {
 });
 
 // ──────────────────────────────────────────────────────────────────────────────
-// DELETE /api/databases/:id/collections/:name — drop an entire collection/table
+// DELETE /api/databases/:id/collections/:name?schema= — drop an entire collection/table
 // ──────────────────────────────────────────────────────────────────────────────
 router.delete('/:id/collections/:name', requireAuth, async (req, res, next) => {
   if (!validIdOr404(req, res)) return;
@@ -390,12 +494,13 @@ router.delete('/:id/collections/:name', requireAuth, async (req, res, next) => {
     const loaded = await loadDatabaseWithUrl(req.user.id, req.params.id);
     if (!loaded) return res.status(404).json({ error: 'Database not found or not active' });
     const { db, internalUrl } = loaded;
+    const schema = resolveSchema(req, db);
     const collection = req.params.name;
 
     if (db.type === 'nosql') {
-      await dropMongoCollection(internalUrl, db.dbName, collection);
+      await dropMongoCollection(internalUrl, schema, collection);
     } else {
-      await dropPostgresTable({ connectionUrl: internalUrl, table: collection });
+      await dropPostgresTable({ connectionUrl: internalUrl, schema, table: collection });
     }
     res.json({ ok: true });
   } catch (err) {
@@ -405,7 +510,7 @@ router.delete('/:id/collections/:name', requireAuth, async (req, res, next) => {
 });
 
 // ──────────────────────────────────────────────────────────────────────────────
-// GET /api/databases/:id/collections/:name?skip=&limit=&filter=
+// GET /api/databases/:id/collections/:name?schema=&skip=&limit=&filter=
 //   filter (mongo only) is a URI-encoded JSON object: ?filter=%7B%22age%22%3A30%7D
 // ──────────────────────────────────────────────────────────────────────────────
 router.get('/:id/collections/:name', requireAuth, async (req, res, next) => {
@@ -414,6 +519,7 @@ router.get('/:id/collections/:name', requireAuth, async (req, res, next) => {
     const loaded = await loadDatabaseWithUrl(req.user.id, req.params.id);
     if (!loaded) return res.status(404).json({ error: 'Database not found or not active' });
     const { db, internalUrl } = loaded;
+    const schema = resolveSchema(req, db);
     const collection = req.params.name;
     const skip = Math.max(0, parseInt(req.query.skip || '0', 10) || 0);
     const limit = Math.max(1, Math.min(500, parseInt(req.query.limit || '50', 10) || 50));
@@ -425,12 +531,12 @@ router.get('/:id/collections/:name', requireAuth, async (req, res, next) => {
         catch { return res.status(400).json({ error: 'filter must be valid JSON' }); }
       }
       const result = await browseMongoCollection({
-        connectionUrl: internalUrl, dbName: db.dbName, collection, skip, limit, filter,
+        connectionUrl: internalUrl, dbName: schema, collection, skip, limit, filter,
       });
       return res.json({ name: collection, type: 'nosql', ...result });
     }
 
-    const result = await browsePostgresTable({ connectionUrl: internalUrl, table: collection, skip, limit });
+    const result = await browsePostgresTable({ connectionUrl: internalUrl, schema, table: collection, skip, limit });
     res.json({ name: collection, type: 'sql', ...result });
   } catch (err) {
     const status = err.status || 500;
@@ -439,7 +545,7 @@ router.get('/:id/collections/:name', requireAuth, async (req, res, next) => {
 });
 
 // ──────────────────────────────────────────────────────────────────────────────
-// PUT/DELETE /api/databases/:id/collections/:name/:docId
+// PUT/DELETE /api/databases/:id/collections/:name/:docId?schema=
 //   Mongo: :docId is the document's _id (hex ObjectId or raw string).
 //   Postgres: :docId is the row's `ctid` (returned as __ctid by the browse
 //   endpoint) — most imported tables have no declared primary key.
@@ -450,6 +556,7 @@ router.put('/:id/collections/:name/:docId', requireAuth, async (req, res, next) 
     const loaded = await loadDatabaseWithUrl(req.user.id, req.params.id);
     if (!loaded) return res.status(404).json({ error: 'Database not found or not active' });
     const { db, internalUrl } = loaded;
+    const schema = resolveSchema(req, db);
     const collection = req.params.name;
 
     if (db.type === 'nosql') {
@@ -457,14 +564,14 @@ router.put('/:id/collections/:name/:docId', requireAuth, async (req, res, next) 
         return res.status(400).json({ error: 'Body must be a JSON object' });
       }
       await updateMongoDocument({
-        connectionUrl: internalUrl, dbName: db.dbName, collection, id: req.params.docId, doc: req.body,
+        connectionUrl: internalUrl, dbName: schema, collection, id: req.params.docId, doc: req.body,
       });
     } else {
       const values = req.body?.values;
       if (!values || typeof values !== 'object') {
         return res.status(400).json({ error: 'Body must be { values: { col: val, ... } }' });
       }
-      await updatePostgresRow({ connectionUrl: internalUrl, table: collection, ctid: req.params.docId, values });
+      await updatePostgresRow({ connectionUrl: internalUrl, schema, table: collection, ctid: req.params.docId, values });
     }
     res.json({ ok: true });
   } catch (err) {
@@ -479,12 +586,13 @@ router.delete('/:id/collections/:name/:docId', requireAuth, async (req, res, nex
     const loaded = await loadDatabaseWithUrl(req.user.id, req.params.id);
     if (!loaded) return res.status(404).json({ error: 'Database not found or not active' });
     const { db, internalUrl } = loaded;
+    const schema = resolveSchema(req, db);
     const collection = req.params.name;
 
     if (db.type === 'nosql') {
-      await deleteMongoDocument({ connectionUrl: internalUrl, dbName: db.dbName, collection, id: req.params.docId });
+      await deleteMongoDocument({ connectionUrl: internalUrl, dbName: schema, collection, id: req.params.docId });
     } else {
-      await deletePostgresRow({ connectionUrl: internalUrl, table: collection, ctid: req.params.docId });
+      await deletePostgresRow({ connectionUrl: internalUrl, schema, table: collection, ctid: req.params.docId });
     }
     res.json({ ok: true });
   } catch (err) {

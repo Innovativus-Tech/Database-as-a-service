@@ -7,7 +7,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { toast } from 'sonner';
 import {
   Database, Leaf, Table2, ChevronDown, Search, RefreshCw,
-  ChevronLeft, ChevronRight, Play, X, Code2, Trash2, Plus,
+  ChevronLeft, ChevronRight, Play, X, Code2, Trash2, Plus, FolderOpen,
 } from 'lucide-react';
 import { api } from '@/lib/api';
 import { useRequireAuth } from '@/lib/auth';
@@ -82,6 +82,115 @@ function DbSelector({ databases, value, onChange }) {
         )}
       </AnimatePresence>
     </div>
+  );
+}
+
+function SchemaSelector({ schemas, primary, value, onChange, onDelete, label }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="relative">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-center justify-between gap-2 rounded border border-border bg-bg-card px-3 py-2 text-left text-sm transition-colors hover:border-border-strong"
+      >
+        <span className="flex min-w-0 items-center gap-2">
+          <FolderOpen className="h-4 w-4 flex-shrink-0 text-text-muted" strokeWidth={1.75} />
+          <span className="truncate font-medium">{value || `Select ${label.toLowerCase()}…`}</span>
+        </span>
+        <ChevronDown className={cn('h-4 w-4 text-text-muted transition-transform', open && 'rotate-180')} />
+      </button>
+      <AnimatePresence>
+        {open && (
+          <>
+            <div className="fixed inset-0 z-10" onClick={() => setOpen(false)} />
+            <motion.ul
+              initial={{ opacity: 0, y: -4 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -4 }}
+              transition={{ duration: 0.15 }}
+              className="absolute z-20 mt-1 max-h-72 w-full overflow-y-auto rounded border border-border bg-bg-card py-1 shadow-xl"
+            >
+              {schemas.length === 0 ? (
+                <li className="px-3 py-2 text-xs text-text-muted">No {label.toLowerCase()}s yet</li>
+              ) : schemas.map((s) => {
+                const active = s === value;
+                const isPrimary = s === primary;
+                return (
+                  <li key={s} className="group flex items-center">
+                    <button
+                      onClick={() => { onChange(s); setOpen(false); }}
+                      className={cn(
+                        'flex flex-1 items-center gap-2 px-3 py-2 text-left text-sm transition-colors',
+                        active ? 'bg-accent-dim text-text-primary' : 'text-text-secondary hover:bg-bg-row hover:text-text-primary'
+                      )}
+                    >
+                      <FolderOpen className="h-4 w-4 text-text-muted" strokeWidth={1.75} />
+                      <span className="truncate">{s}</span>
+                      {isPrimary && <span className="ml-auto text-[10px] text-text-muted">primary</span>}
+                    </button>
+                    {!isPrimary && (
+                      <button
+                        onClick={(e) => { e.stopPropagation(); onDelete(s); }}
+                        className="hidden p-1.5 text-text-muted hover:text-danger group-hover:block"
+                        aria-label={`Drop ${s}`}
+                      >
+                        <Trash2 className="h-3.5 w-3.5" strokeWidth={1.75} />
+                      </button>
+                    )}
+                  </li>
+                );
+              })}
+            </motion.ul>
+          </>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+}
+
+function NewSchemaForm({ isMongo, label, onCreate, onCancel }) {
+  const [name, setName] = useState('');
+  const [firstCollection, setFirstCollection] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+
+  async function onSubmit(e) {
+    e.preventDefault();
+    setError(null);
+    setBusy(true);
+    try {
+      await onCreate(isMongo ? { name, firstCollection } : { name });
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <form onSubmit={onSubmit} className="mb-2 space-y-2 rounded border border-border bg-bg-inset p-2.5">
+      <input
+        autoFocus
+        value={name}
+        onChange={(e) => setName(e.target.value)}
+        placeholder={`${label} name`}
+        className="h-8 w-full rounded border border-border-strong bg-bg-card px-2 font-mono text-xs text-text-primary outline-none focus:border-accent"
+      />
+      {isMongo && (
+        <input
+          value={firstCollection}
+          onChange={(e) => setFirstCollection(e.target.value)}
+          placeholder="First collection name"
+          className="h-8 w-full rounded border border-border-strong bg-bg-card px-2 font-mono text-xs text-text-primary outline-none focus:border-accent"
+        />
+      )}
+      {isMongo && <p className="text-[11px] text-text-muted">Mongo needs at least one collection to create the database.</p>}
+      {error && <p className="text-[11px] text-danger">{error}</p>}
+      <div className="flex items-center gap-2 pt-0.5">
+        <Button type="submit" size="sm" loading={busy} className="flex-1">Create</Button>
+        <Button type="button" size="sm" variant="ghost" onClick={onCancel}>Cancel</Button>
+      </div>
+    </form>
   );
 }
 
@@ -243,7 +352,7 @@ function SqlView({ columns, rows, onSelect }) {
   );
 }
 
-function DocSlideOver({ db, collection, isMongo, doc, onClose, onChanged }) {
+function DocSlideOver({ db, collection, schema, isMongo, doc, onClose, onChanged }) {
   const [text, setText] = useState(() => isMongo ? JSON.stringify(doc, null, 2) : '');
   const [values, setValues] = useState(() => isMongo ? {} : { ...doc });
   const [busy, setBusy] = useState(false);
@@ -260,14 +369,14 @@ function DocSlideOver({ db, collection, isMongo, doc, onClose, onChanged }) {
         let parsed;
         try { parsed = JSON.parse(text); }
         catch { setError('Invalid JSON'); setBusy(false); return; }
-        await api.updateDocument(db.id, collection, docId, parsed);
+        await api.updateDocument(db.id, collection, docId, parsed, schema);
       } else {
         const changed = {};
         for (const k of Object.keys(values)) {
           if (k === '__ctid') continue;
           if (values[k] !== doc[k]) changed[k] = values[k];
         }
-        await api.updateDocument(db.id, collection, docId, { values: changed });
+        await api.updateDocument(db.id, collection, docId, { values: changed }, schema);
       }
       toast.success('Saved');
       onChanged();
@@ -282,7 +391,7 @@ function DocSlideOver({ db, collection, isMongo, doc, onClose, onChanged }) {
   async function onDelete() {
     setBusy(true);
     try {
-      await api.deleteDocument(db.id, collection, docId);
+      await api.deleteDocument(db.id, collection, docId, schema);
       toast.success('Deleted');
       onChanged();
       onClose();
@@ -355,6 +464,8 @@ export default function BrowsePage() {
   const [pendingFilter, setPendingFilter] = useState('');
   const [selectedDoc, setSelectedDoc] = useState(null);
   const [creatingColl, setCreatingColl] = useState(false);
+  const [selectedSchema, setSelectedSchema] = useState(null);
+  const [creatingSchema, setCreatingSchema] = useState(false);
 
   const { data: dbList, isLoading: loadingDbs } = useQuery({
     queryKey: ['databases'],
@@ -362,6 +473,8 @@ export default function BrowsePage() {
   });
   const dbs = dbList?.databases ?? [];
   const selectedDb = dbs.find(d => d.id === selectedDbId);
+  const isMongo = selectedDb?.type === 'nosql';
+  const schemaLabel = isMongo ? 'Database' : 'Schema';
 
   // Auto-pick first DB once loaded
   useEffect(() => {
@@ -370,17 +483,56 @@ export default function BrowsePage() {
 
   // Reset selection when changing DBs
   useEffect(() => {
+    setSelectedSchema(null);
     setSelectedColl(null);
     setSkip(0); setFilter(''); setPendingFilter(''); setFilterError(null);
   }, [selectedDbId]);
 
-  const { data: collsResp, isLoading: loadingColls, refetch: refetchColls } = useQuery({
-    queryKey: ['collections', selectedDbId],
-    queryFn: () => api.listCollections(selectedDbId),
+  const { data: schemasResp, isLoading: loadingSchemas, refetch: refetchSchemas } = useQuery({
+    queryKey: ['schemas', selectedDbId],
+    queryFn: () => api.listSchemas(selectedDbId),
     enabled: !!selectedDbId,
   });
+  const schemas = schemasResp?.schemas ?? [];
+  const primarySchema = schemasResp?.primary;
+
+  // Auto-pick the primary schema once schemas load
+  useEffect(() => {
+    if (!selectedSchema && primarySchema) setSelectedSchema(primarySchema);
+  }, [primarySchema, selectedSchema]);
+
+  async function onCreateSchema(payload) {
+    await api.createSchema(selectedDbId, payload);
+    toast.success(`Created ${schemaLabel.toLowerCase()} "${payload.name}"`);
+    setCreatingSchema(false);
+    setSelectedSchema(payload.name);
+    refetchSchemas();
+  }
+
+  async function onDropSchema(name) {
+    if (!window.confirm(`Permanently drop "${name}" and everything inside it? This can't be undone.`)) return;
+    try {
+      await api.dropSchema(selectedDbId, name);
+      toast.success(`Dropped "${name}"`);
+      if (selectedSchema === name) setSelectedSchema(primarySchema);
+      refetchSchemas();
+    } catch (err) {
+      toast.error(err.message);
+    }
+  }
+
+  // Reset collection selection when switching schemas
+  useEffect(() => {
+    setSelectedColl(null);
+    setSkip(0); setFilter(''); setPendingFilter(''); setFilterError(null);
+  }, [selectedSchema]);
+
+  const { data: collsResp, isLoading: loadingColls, refetch: refetchColls } = useQuery({
+    queryKey: ['collections', selectedDbId, selectedSchema],
+    queryFn: () => api.listCollections(selectedDbId, selectedSchema),
+    enabled: !!selectedDbId && !!selectedSchema,
+  });
   const collections = collsResp?.collections ?? [];
-  const isMongo = collsResp?.type === 'nosql' || selectedDb?.type === 'nosql';
 
   const { data: columnTypesResp } = useQuery({
     queryKey: ['columnTypes'],
@@ -391,7 +543,7 @@ export default function BrowsePage() {
   const pgTypes = columnTypesResp?.types ?? [];
 
   async function onCreateCollection(payload) {
-    await api.createCollection(selectedDbId, payload);
+    await api.createCollection(selectedDbId, { ...payload, schema: selectedSchema });
     toast.success(`Created ${isMongo ? 'collection' : 'table'} "${payload.name}"`);
     setCreatingColl(false);
     setSelectedColl(payload.name);
@@ -401,7 +553,7 @@ export default function BrowsePage() {
   async function onDropCollection(name) {
     if (!window.confirm(`Permanently drop "${name}" and all its data? This can't be undone.`)) return;
     try {
-      await api.dropCollection(selectedDbId, name);
+      await api.dropCollection(selectedDbId, name, selectedSchema);
       toast.success(`Dropped "${name}"`);
       if (selectedColl === name) setSelectedColl(null);
       refetchColls();
@@ -423,11 +575,11 @@ export default function BrowsePage() {
   }, [filter, isMongo]);
 
   const { data: browseData, isFetching: loadingData, error: browseError, refetch: refetchData } = useQuery({
-    queryKey: ['browse', selectedDbId, selectedColl, skip, limit, validatedFilter],
+    queryKey: ['browse', selectedDbId, selectedSchema, selectedColl, skip, limit, validatedFilter],
     queryFn: () => api.browseCollection(selectedDbId, selectedColl, {
-      skip, limit, filter: validatedFilter,
+      skip, limit, filter: validatedFilter, schema: selectedSchema,
     }),
-    enabled: !!(selectedDbId && selectedColl) && validatedFilter !== null,
+    enabled: !!(selectedDbId && selectedSchema && selectedColl) && validatedFilter !== null,
   });
 
   function applyFilter() {
@@ -455,7 +607,7 @@ export default function BrowsePage() {
     <AppShell>
       <Topbar
         title="Browse Data"
-        subtitle={selectedDb ? `${selectedDb.name} · ${selectedColl || 'no selection'}` : 'Pick a database to start'}
+        subtitle={selectedDb ? `${selectedDb.name} / ${selectedSchema || '…'} · ${selectedColl || 'no selection'}` : 'Pick a database to start'}
         actions={
           <Button
             size="sm"
@@ -475,6 +627,40 @@ export default function BrowsePage() {
             {loadingDbs
               ? <Skeleton className="h-9" />
               : <DbSelector databases={dbs} value={selectedDbId} onChange={setSelectedDbId} />
+            }
+          </div>
+          <div className="border-b border-border p-3">
+            <div className="mb-1.5 flex items-center justify-between">
+              <span className="text-xs font-medium uppercase tracking-wider text-text-muted">{schemaLabel}</span>
+              <button
+                onClick={() => setCreatingSchema((v) => !v)}
+                disabled={!selectedDb}
+                className="rounded p-1 text-text-secondary hover:bg-bg-inset hover:text-text-primary disabled:opacity-40"
+                aria-label={`New ${schemaLabel.toLowerCase()}`}
+              >
+                <Plus className="h-3.5 w-3.5" strokeWidth={2} />
+              </button>
+            </div>
+            {creatingSchema && (
+              <NewSchemaForm
+                isMongo={isMongo}
+                label={schemaLabel}
+                onCreate={onCreateSchema}
+                onCancel={() => setCreatingSchema(false)}
+              />
+            )}
+            {loadingSchemas
+              ? <Skeleton className="h-9" />
+              : (
+                <SchemaSelector
+                  schemas={schemas}
+                  primary={primarySchema}
+                  value={selectedSchema}
+                  onChange={setSelectedSchema}
+                  onDelete={onDropSchema}
+                  label={schemaLabel}
+                />
+              )
             }
           </div>
           <div className="flex items-center justify-between px-3 pt-3 pb-1">
@@ -619,6 +805,7 @@ export default function BrowsePage() {
               key="doc-slideover"
               db={selectedDb}
               collection={selectedColl}
+              schema={selectedSchema}
               isMongo={isMongo}
               doc={selectedDoc}
               onClose={() => setSelectedDoc(null)}

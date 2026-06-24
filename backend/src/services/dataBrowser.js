@@ -13,6 +13,34 @@ async function withMongo(connectionUrl, fn) {
   }
 }
 
+const MONGO_SYSTEM_DBS = new Set(['admin', 'config', 'local']);
+
+async function listMongoDatabases(connectionUrl) {
+  return withMongo(connectionUrl, async (client) => {
+    const { databases } = await client.db().admin().listDatabases({ nameOnly: true });
+    return databases
+      .map((d) => d.name)
+      .filter((name) => !MONGO_SYSTEM_DBS.has(name))
+      .sort();
+  });
+}
+
+// Mongo only materializes a database once it has at least one real collection
+// in it, so "creating" one means creating its first collection in the same step.
+async function createMongoDatabase(connectionUrl, dbName, firstCollection) {
+  return withMongo(connectionUrl, async (client) => {
+    await client.db(dbName).createCollection(firstCollection);
+    return { ok: true };
+  });
+}
+
+async function dropMongoDatabase(connectionUrl, dbName) {
+  return withMongo(connectionUrl, async (client) => {
+    await client.db(dbName).dropDatabase();
+    return { ok: true };
+  });
+}
+
 async function listMongoCollections(connectionUrl, dbName) {
   return withMongo(connectionUrl, async (client) => {
     const db = client.db(dbName);
@@ -88,6 +116,8 @@ async function dropMongoCollection(connectionUrl, dbName, name) {
 const PG_IDENT_RE = /^[a-zA-Z_][a-zA-Z0-9_]{0,62}$/;
 function validIdent(name) { return typeof name === 'string' && PG_IDENT_RE.test(name); }
 
+function qualify(schema, table) { return `"${schema}"."${table}"`; }
+
 async function withPg(connectionUrl, fn) {
   const client = new PgClient({ connectionString: connectionUrl, connectionTimeoutMillis: 5000 });
   await client.connect();
@@ -98,7 +128,41 @@ async function withPg(connectionUrl, fn) {
   }
 }
 
-async function listPostgresTables(connectionUrl) {
+const PG_SYSTEM_SCHEMAS_RE = /^(pg_catalog|information_schema|pg_toast|pg_temp_\d+|pg_toast_temp_\d+)$/;
+
+async function listPostgresSchemas(connectionUrl) {
+  return withPg(connectionUrl, async (client) => {
+    const { rows } = await client.query(
+      `SELECT schema_name FROM information_schema.schemata
+        WHERE schema_name !~ $1
+        ORDER BY schema_name`,
+      [PG_SYSTEM_SCHEMAS_RE.source]
+    );
+    return rows.map((r) => r.schema_name);
+  });
+}
+
+async function createPostgresSchema(connectionUrl, schema) {
+  if (!validIdent(schema)) {
+    throw Object.assign(new Error('Invalid schema name'), { status: 400 });
+  }
+  return withPg(connectionUrl, async (client) => {
+    await client.query(`CREATE SCHEMA "${schema}"`);
+    return { ok: true };
+  });
+}
+
+async function dropPostgresSchema(connectionUrl, schema) {
+  if (!validIdent(schema)) {
+    throw Object.assign(new Error('Invalid schema name'), { status: 400 });
+  }
+  return withPg(connectionUrl, async (client) => {
+    await client.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    return { ok: true };
+  });
+}
+
+async function listPostgresTables({ connectionUrl, schema = 'public' }) {
   return withPg(connectionUrl, async (client) => {
     const sql = `
       SELECT c.relname AS name,
@@ -106,9 +170,9 @@ async function listPostgresTables(connectionUrl) {
       FROM pg_class c
       JOIN pg_namespace n ON n.oid = c.relnamespace
       WHERE c.relkind = 'r'
-        AND n.nspname NOT IN ('pg_catalog','information_schema')
+        AND n.nspname = $1
       ORDER BY c.relname;`;
-    const { rows } = await client.query(sql);
+    const { rows } = await client.query(sql, [schema]);
 
     // reltuples is -1 until ANALYZE runs. For freshly-imported tables that's
     // almost always the case, so fall back to a real COUNT(*) per table.
@@ -116,7 +180,7 @@ async function listPostgresTables(connectionUrl) {
     for (const r of rows) {
       let count = Number(r.estimated_count);
       if (count < 0) {
-        const exact = await client.query(`SELECT COUNT(*)::bigint AS c FROM "${r.name}"`);
+        const exact = await client.query(`SELECT COUNT(*)::bigint AS c FROM ${qualify(schema, r.name)}`);
         count = Number(exact.rows[0].c);
       }
       out.push({ name: r.name, count });
@@ -125,44 +189,44 @@ async function listPostgresTables(connectionUrl) {
   });
 }
 
-async function browsePostgresTable({ connectionUrl, table, skip = 0, limit = 50 }) {
-  if (!validIdent(table)) {
-    throw Object.assign(new Error('Invalid table name'), { status: 400 });
+async function browsePostgresTable({ connectionUrl, schema = 'public', table, skip = 0, limit = 50 }) {
+  if (!validIdent(schema) || !validIdent(table)) {
+    throw Object.assign(new Error('Invalid schema or table name'), { status: 400 });
   }
   return withPg(connectionUrl, async (client) => {
     const colsRes = await client.query(
       `SELECT column_name FROM information_schema.columns
-        WHERE table_schema='public' AND table_name=$1
+        WHERE table_schema=$1 AND table_name=$2
         ORDER BY ordinal_position`,
-      [table]
+      [schema, table]
     );
     if (colsRes.rows.length === 0) {
       throw Object.assign(new Error('Table not found'), { status: 404 });
     }
     const columns = colsRes.rows.map((r) => r.column_name);
 
-    const countRes = await client.query(`SELECT COUNT(*)::bigint AS c FROM "${table}"`);
+    const countRes = await client.query(`SELECT COUNT(*)::bigint AS c FROM ${qualify(schema, table)}`);
     const total = Number(countRes.rows[0].c);
 
     // ctid (physical row id) lets the client edit/delete a specific row even
     // though most tables here have no declared primary key. It's only stable
     // for the lifetime of this page load (an UPDATE/VACUUM can change it).
     const rowsRes = await client.query(
-      `SELECT *, ctid::text AS "__ctid" FROM "${table}" LIMIT $1 OFFSET $2`,
+      `SELECT *, ctid::text AS "__ctid" FROM ${qualify(schema, table)} LIMIT $1 OFFSET $2`,
       [Math.min(limit, 500), skip]
     );
     return { total, skip, limit, columns, rows: rowsRes.rows };
   });
 }
 
-async function updatePostgresRow({ connectionUrl, table, ctid, values }) {
-  if (!validIdent(table)) {
-    throw Object.assign(new Error('Invalid table name'), { status: 400 });
+async function updatePostgresRow({ connectionUrl, schema = 'public', table, ctid, values }) {
+  if (!validIdent(schema) || !validIdent(table)) {
+    throw Object.assign(new Error('Invalid schema or table name'), { status: 400 });
   }
   return withPg(connectionUrl, async (client) => {
     const colsRes = await client.query(
-      `SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name=$1`,
-      [table]
+      `SELECT column_name FROM information_schema.columns WHERE table_schema=$1 AND table_name=$2`,
+      [schema, table]
     );
     const validCols = new Set(colsRes.rows.map((r) => r.column_name));
     const setCols = Object.keys(values || {}).filter((c) => validCols.has(c));
@@ -173,7 +237,7 @@ async function updatePostgresRow({ connectionUrl, table, ctid, values }) {
     const params = setCols.map((c) => values[c]);
     params.push(ctid);
     const result = await client.query(
-      `UPDATE "${table}" SET ${setSql} WHERE ctid = $${params.length}::tid`,
+      `UPDATE ${qualify(schema, table)} SET ${setSql} WHERE ctid = $${params.length}::tid`,
       params
     );
     if (result.rowCount === 0) throw Object.assign(new Error('Row not found'), { status: 404 });
@@ -181,12 +245,12 @@ async function updatePostgresRow({ connectionUrl, table, ctid, values }) {
   });
 }
 
-async function deletePostgresRow({ connectionUrl, table, ctid }) {
-  if (!validIdent(table)) {
-    throw Object.assign(new Error('Invalid table name'), { status: 400 });
+async function deletePostgresRow({ connectionUrl, schema = 'public', table, ctid }) {
+  if (!validIdent(schema) || !validIdent(table)) {
+    throw Object.assign(new Error('Invalid schema or table name'), { status: 400 });
   }
   return withPg(connectionUrl, async (client) => {
-    const result = await client.query(`DELETE FROM "${table}" WHERE ctid = $1::tid`, [ctid]);
+    const result = await client.query(`DELETE FROM ${qualify(schema, table)} WHERE ctid = $1::tid`, [ctid]);
     if (result.rowCount === 0) throw Object.assign(new Error('Row not found'), { status: 404 });
     return { ok: true };
   });
@@ -194,9 +258,9 @@ async function deletePostgresRow({ connectionUrl, table, ctid }) {
 
 const PG_COLUMN_TYPES = new Set(['text', 'integer', 'bigint', 'boolean', 'timestamptz', 'numeric', 'double precision', 'jsonb']);
 
-async function createPostgresTable({ connectionUrl, table, columns }) {
-  if (!validIdent(table)) {
-    throw Object.assign(new Error('Invalid table name'), { status: 400 });
+async function createPostgresTable({ connectionUrl, schema = 'public', table, columns }) {
+  if (!validIdent(schema) || !validIdent(table)) {
+    throw Object.assign(new Error('Invalid schema or table name'), { status: 400 });
   }
   if (!Array.isArray(columns) || columns.length === 0) {
     throw Object.assign(new Error('At least one column is required'), { status: 400 });
@@ -207,28 +271,34 @@ async function createPostgresTable({ connectionUrl, table, columns }) {
     return `"${c.name}" ${c.type}`;
   });
   return withPg(connectionUrl, async (client) => {
-    await client.query(`CREATE TABLE "${table}" (${defs.join(', ')})`);
+    await client.query(`CREATE TABLE ${qualify(schema, table)} (${defs.join(', ')})`);
     return { ok: true };
   });
 }
 
-async function dropPostgresTable({ connectionUrl, table }) {
-  if (!validIdent(table)) {
-    throw Object.assign(new Error('Invalid table name'), { status: 400 });
+async function dropPostgresTable({ connectionUrl, schema = 'public', table }) {
+  if (!validIdent(schema) || !validIdent(table)) {
+    throw Object.assign(new Error('Invalid schema or table name'), { status: 400 });
   }
   return withPg(connectionUrl, async (client) => {
-    await client.query(`DROP TABLE IF EXISTS "${table}"`);
+    await client.query(`DROP TABLE IF EXISTS ${qualify(schema, table)}`);
     return { ok: true };
   });
 }
 
 module.exports = {
+  listMongoDatabases,
+  createMongoDatabase,
+  dropMongoDatabase,
   listMongoCollections,
   browseMongoCollection,
   updateMongoDocument,
   deleteMongoDocument,
   createMongoCollection,
   dropMongoCollection,
+  listPostgresSchemas,
+  createPostgresSchema,
+  dropPostgresSchema,
   listPostgresTables,
   browsePostgresTable,
   updatePostgresRow,
