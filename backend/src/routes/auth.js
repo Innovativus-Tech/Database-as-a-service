@@ -36,6 +36,8 @@ function publicUser(user) {
     plan: user.plan,
     displayName: user.displayName,
     avatarUrl: user.avatarUrl,
+    fullName: user.fullName,
+    organizationName: user.organizationName,
     twoFactorEnabled: user.twoFactorEnabled,
     createdAt: user.createdAt,
   };
@@ -46,11 +48,18 @@ router.post('/signup', async (req, res, next) => {
     const { error, email, password } = validateCredentials(req.body);
     if (error) return res.status(400).json({ error });
 
+    const fullName = typeof req.body?.fullName === 'string' ? req.body.fullName.trim().slice(0, 80) : '';
+    const organizationName = typeof req.body?.organizationName === 'string' ? req.body.organizationName.trim().slice(0, 80) : '';
+    if (!fullName) return res.status(400).json({ error: 'Full name is required' });
+    if (!organizationName) return res.status(400).json({ error: 'Organization name is required' });
+
     const existing = await prisma.user.findUnique({ where: { email } });
     if (existing) return res.status(409).json({ error: 'Email already registered' });
 
     const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
-    const user = await prisma.user.create({ data: { email, passwordHash } });
+    const user = await prisma.user.create({
+      data: { email, passwordHash, fullName, organizationName, displayName: fullName },
+    });
 
     const token = await createSession(user, req);
     res.status(201).json({ user: publicUser(user), token });
@@ -106,6 +115,14 @@ router.patch('/me', requireAuth, async (req, res, next) => {
     if (typeof req.body?.displayName === 'string') {
       const name = req.body.displayName.trim().slice(0, 80);
       data.displayName = name || null;
+    }
+    if (typeof req.body?.fullName === 'string') {
+      const name = req.body.fullName.trim().slice(0, 80);
+      data.fullName = name || null;
+    }
+    if (typeof req.body?.organizationName === 'string') {
+      const name = req.body.organizationName.trim().slice(0, 80);
+      data.organizationName = name || null;
     }
     if (typeof req.body?.avatarUrl === 'string') {
       if (req.body.avatarUrl === '') {

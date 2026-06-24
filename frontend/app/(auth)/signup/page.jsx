@@ -13,16 +13,21 @@ import Input from '@/components/ui/Input';
 export default function SignupPage() {
   const router = useRouter();
   const { login } = useAuth();
+  const [organizationName, setOrganizationName] = useState('');
+  const [fullName, setFullName] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
 
   async function onSubmit(e) {
     e.preventDefault();
-    setBusy(true); setError(null);
+    setError(null);
+    if (password !== confirmPassword) { setError('Passwords do not match'); return; }
+    setBusy(true);
     try {
-      const res = await api.signup(email, password);
+      const res = await api.signup({ email, password, fullName, organizationName });
       login(res);
       toast.success('Account created');
       router.push('/dashboard');
@@ -49,6 +54,20 @@ export default function SignupPage() {
 
         <form onSubmit={onSubmit} className="mt-8 space-y-4">
           <Input
+            label="Organization Name"
+            required
+            value={organizationName}
+            onChange={(e) => setOrganizationName(e.target.value)}
+            placeholder="Acme Inc."
+          />
+          <Input
+            label="Your Full Name"
+            required
+            value={fullName}
+            onChange={(e) => setFullName(e.target.value)}
+            placeholder="Ada Lovelace"
+          />
+          <Input
             label="Email"
             type="email"
             required
@@ -65,6 +84,15 @@ export default function SignupPage() {
             onChange={(e) => setPassword(e.target.value)}
             placeholder="At least 8 characters"
             helper="Minimum 8 characters."
+          />
+          <Input
+            label="Confirm Password"
+            type="password"
+            required
+            minLength={8}
+            value={confirmPassword}
+            onChange={(e) => setConfirmPassword(e.target.value)}
+            placeholder="Re-enter your password"
             error={error}
           />
           <Button type="submit" loading={busy} className="w-full" size="lg">

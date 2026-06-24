@@ -17,6 +17,7 @@ const {
   resolveNames,
   getDirectorySize,
   removeDataDir,
+  removeInitScript,
   deriveNames,
 } = require('../services/provisioning');
 const { dispatchImport } = require('../services/dataImport');
@@ -164,6 +165,7 @@ router.post('/create', requireAuth, async (req, res, next) => {
   } catch (err) {
     console.error('[databases/create] provisioning failed, rolling back:', err.message);
     try { await stopAndRemoveContainer(containerName); } catch (e) { console.error('cleanup:', e.message); }
+    try { await removeInitScript(containerName); } catch (e) { /* best-effort */ }
     try { await removeStreamBlock(port); await reloadNginx(); } catch (e) { /* best-effort */ }
     await prisma.database.delete({ where: { id: database.id } }).catch(() => {});
     return res.status(500).json({ error: 'Failed to provision container', detail: err.message });
@@ -606,6 +608,9 @@ router.delete('/:id', requireAuth, async (req, res, next) => {
 
     try { await removeDataDir(dataDir); }
     catch (e) { console.error('[delete] data dir cleanup:', e.message); }
+
+    try { await removeInitScript(containerName); }
+    catch (e) { console.error('[delete] init script cleanup:', e.message); }
 
     if (db.routing === 'nginx') {
       try { await removeStreamBlock(db.port); await reloadNginx(); }

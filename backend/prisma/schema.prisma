@@ -37,6 +37,8 @@ model User {
   plan             Plan       @default(free)
   displayName      String?
   avatarUrl        String?
+  fullName         String?
+  organizationName String?
   twoFactorSecret  String?
   twoFactorEnabled Boolean    @default(false)
   createdAt        DateTime   @default(now())

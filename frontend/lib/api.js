@@ -46,13 +46,13 @@ async function request(path, { method = 'GET', body, formData, headers = {} } = 
 }
 
 export const api = {
-  signup: (email, password) => request('/api/auth/signup', { method: 'POST', body: { email, password } }),
+  signup: ({ email, password, fullName, organizationName }) =>
+    request('/api/auth/signup', { method: 'POST', body: { email, password, fullName, organizationName } }),
   login:  (email, password, totp) => request('/api/auth/login',  { method: 'POST', body: { email, password, ...(totp ? { totp } : {}) } }),
   me:     () => request('/api/auth/me'),
   updateProfile:  (data) => request('/api/auth/me', { method: 'PATCH', body: data }),
   changePassword: (data) => request('/api/auth/password', { method: 'POST', body: data }),
   deleteAccount:  () => request('/api/auth/me', { method: 'DELETE', body: { confirm: 'CONFIRM' } }),
-  getUsage: () => request('/api/auth/usage'),
 
   getSessions:   () => request('/api/auth/sessions'),
   revokeSession: (id) => request(`/api/auth/sessions/${id}`, { method: 'DELETE' }),

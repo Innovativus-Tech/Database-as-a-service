@@ -38,7 +38,9 @@ const sections = [
 
 export default function Sidebar() {
   const pathname = usePathname();
-  const { email, logout } = useAuth();
+  const { user, email, logout } = useAuth();
+  const name = user?.displayName || user?.fullName || email;
+  const initial = (name || '?')[0].toUpperCase();
 
   return (
     <aside className="fixed left-0 top-0 z-30 flex h-screen w-55 flex-col border-r border-border bg-bg-sidebar">
@@ -86,12 +88,16 @@ export default function Sidebar() {
       {/* User */}
       <div className="border-t border-border p-3">
         <div className="flex items-center gap-3 rounded px-2 py-2">
-          <div className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-full bg-accent-dim text-xs font-medium text-accent">
-            {email ? email[0].toUpperCase() : '?'}
-          </div>
+          {user?.avatarUrl ? (
+            <img src={user.avatarUrl} alt="" className="h-8 w-8 flex-shrink-0 rounded-full object-cover" />
+          ) : (
+            <div className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-full bg-accent-dim text-xs font-medium text-accent">
+              {initial}
+            </div>
+          )}
           <div className="min-w-0 flex-1">
-            <div className="truncate text-xs font-medium text-text-primary">{email || 'Not signed in'}</div>
-            <div className="text-xs text-text-muted">Free plan</div>
+            <div className="truncate text-xs font-medium text-text-primary">{name || 'Not signed in'}</div>
+            <div className="truncate text-xs text-text-muted">{user?.organizationName || email || ''}</div>
           </div>
           <button
             onClick={logout}

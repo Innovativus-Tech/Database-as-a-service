@@ -15,17 +15,6 @@ import Button from '@/components/ui/Button';
 import Input from '@/components/ui/Input';
 import { cn } from '@/lib/cn';
 
-function fmtBytes(n) {
-  if (!n || n < 1024) return `${n || 0} B`;
-  const units = ['KB', 'MB', 'GB', 'TB'];
-  let v = n / 1024;
-  for (const u of units) {
-    if (v < 1024) return `${v.toFixed(1)} ${u}`;
-    v /= 1024;
-  }
-  return `${v.toFixed(1)} PB`;
-}
-
 function timeAgo(iso) {
   const s = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
   if (s < 60) return 'just now';
@@ -34,7 +23,7 @@ function timeAgo(iso) {
   return `${Math.floor(s / 86400)} days ago`;
 }
 
-const SECTIONS = ['Profile', 'Security', 'Plan & Billing', 'Danger Zone'];
+const SECTIONS = ['Profile', 'Security', 'Danger Zone'];
 
 function SubNavLink({ children, active, danger, onClick }) {
   return (
@@ -82,6 +71,8 @@ function Toggle({ on, onClick, disabled }) {
 // ── Profile ─────────────────────────────────────────────────────────────────
 function ProfileSection({ user, onUpdated }) {
   const [displayName, setDisplayName] = useState(user.displayName || '');
+  const [fullName, setFullName] = useState(user.fullName || '');
+  const [organizationName, setOrganizationName] = useState(user.organizationName || '');
   const [busy, setBusy] = useState(false);
   const fileRef = useRef(null);
 
@@ -117,7 +108,7 @@ function ProfileSection({ user, onUpdated }) {
   async function onSave() {
     setBusy(true);
     try {
-      const res = await api.updateProfile({ displayName });
+      const res = await api.updateProfile({ displayName, fullName, organizationName });
       onUpdated(res.user);
       toast.success('Profile saved');
     } catch (err) {
@@ -152,6 +143,14 @@ function ProfileSection({ user, onUpdated }) {
       <div className="mb-5 max-w-[360px]">
         <FieldLabel>Display name</FieldLabel>
         <Input value={displayName} onChange={(e) => setDisplayName(e.target.value)} placeholder="Your name" />
+      </div>
+      <div className="mb-5 max-w-[360px]">
+        <FieldLabel>Full name</FieldLabel>
+        <Input value={fullName} onChange={(e) => setFullName(e.target.value)} placeholder="Your full name" />
+      </div>
+      <div className="mb-5 max-w-[360px]">
+        <FieldLabel>Organization</FieldLabel>
+        <Input value={organizationName} onChange={(e) => setOrganizationName(e.target.value)} placeholder="Your organization" />
       </div>
       <div className="mb-7 max-w-[360px]">
         <FieldLabel>Email</FieldLabel>
@@ -323,69 +322,6 @@ function SecuritySection({ user, onUpdated }) {
   );
 }
 
-// ── Plan & Billing ──────────────────────────────────────────────────────────
-function PlanSection() {
-  const { data, isLoading } = useQuery({ queryKey: ['usage'], queryFn: api.getUsage });
-
-  function onUpgrade() {
-    toast('Billing isn\'t available yet on this self-hosted instance.', {
-      description: 'CustomDB Pro requires a payment processor — not wired up here. Reach out if you need higher limits.',
-    });
-  }
-
-  if (isLoading || !data) return <p className="text-sm text-text-secondary">Loading...</p>;
-
-  const dbPct = Math.min(100, (data.databaseCount / data.databaseLimit) * 100);
-  const storagePct = Math.min(100, (data.storageUsed / data.storageLimit) * 100);
-
-  return (
-    <div className="max-w-[520px]">
-      <div className="mb-6 flex items-center justify-between rounded-lg border border-border bg-bg-card p-5">
-        <div>
-          <div className="flex items-center gap-2.5">
-            <span className="text-base font-medium">Free Tier</span>
-            <span className="rounded-sm border border-border-strong bg-bg-inset px-2 py-0.5 text-[11px] text-text-secondary">Current plan</span>
-          </div>
-          <div className="mt-1.5 text-sm text-text-secondary">
-            {data.databaseLimit} databases · {fmtBytes(data.storageLimit)} storage · community support
-          </div>
-        </div>
-      </div>
-
-      <div className="mb-6 flex flex-col gap-4">
-        <div>
-          <div className="mb-2 flex justify-between text-sm">
-            <span className="text-text-secondary">Databases</span>
-            <span className="text-text-primary">{data.databaseCount} / {data.databaseLimit}</span>
-          </div>
-          <div className="h-1 w-full overflow-hidden rounded-full bg-[rgba(255,255,255,0.06)]">
-            <div className="h-full rounded-full bg-accent" style={{ width: `${dbPct}%` }} />
-          </div>
-        </div>
-        <div>
-          <div className="mb-2 flex justify-between text-sm">
-            <span className="text-text-secondary">Storage</span>
-            <span className="text-text-primary">{fmtBytes(data.storageUsed)} / {fmtBytes(data.storageLimit)}</span>
-          </div>
-          <div className="h-1 w-full overflow-hidden rounded-full bg-[rgba(255,255,255,0.06)]">
-            <div className="h-full rounded-full bg-accent" style={{ width: `${storagePct}%` }} />
-          </div>
-        </div>
-      </div>
-
-      <div className="rounded-lg border border-accent/30 bg-bg-card p-5">
-        <div className="text-base font-medium">Upgrade to Pro</div>
-        <div className="my-3.5 flex flex-col gap-2 text-sm text-text-secondary">
-          {['Unlimited databases', '100 GB storage', 'Daily automated backups', 'Priority support'].map((f) => (
-            <span key={f} className="flex items-center gap-2"><Check className="h-3.5 w-3.5 text-accent" strokeWidth={2} />{f}</span>
-          ))}
-        </div>
-        <Button onClick={onUpgrade}>Upgrade to Pro — $19/mo</Button>
-      </div>
-    </div>
-  );
-}
-
 // ── Danger Zone ─────────────────────────────────────────────────────────────
 function DangerSection() {
   const router = useRouter();
@@ -439,12 +375,14 @@ function DangerSection() {
 
 export default function SettingsPage() {
   useRequireAuth();
+  const { setUser } = useAuth();
   const { data, isLoading } = useQuery({ queryKey: ['me'], queryFn: api.me });
   const queryClient = useQueryClient();
   const [section, setSection] = useState('Profile');
 
   function onUpdated(user) {
     queryClient.setQueryData(['me'], { user });
+    setUser(user);
   }
 
   return (
@@ -465,8 +403,6 @@ export default function SettingsPage() {
             <ProfileSection user={data.user} onUpdated={onUpdated} />
           ) : section === 'Security' ? (
             <SecuritySection user={data.user} onUpdated={onUpdated} />
-          ) : section === 'Plan & Billing' ? (
-            <PlanSection />
           ) : (
             <DangerSection />
           )}

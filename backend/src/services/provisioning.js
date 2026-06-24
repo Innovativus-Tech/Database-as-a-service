@@ -2,6 +2,7 @@ const path = require('path');
 const fs = require('fs');
 const Docker = require('dockerode');
 const { networkName } = require('./dockerNetwork');
+const { randomToken } = require('./crypto');
 
 const docker = new Docker({ socketPath: process.env.DOCKER_SOCKET || '/var/run/docker.sock' });
 
@@ -26,6 +27,20 @@ function deriveNames({ type, dbName, userId }) {
 function ensureDataDir(dir) {
   fs.mkdirSync(dir, { recursive: true });
   return dir;
+}
+
+function initScriptDir() {
+  return ensureDataDir(path.join(dataRoot(), '_init'));
+}
+
+// Removes the one-off init script (if any) left behind for a container. Safe
+// to call even if neither extension exists (e.g. legacy root-scoped DBs).
+async function removeInitScript(containerName) {
+  for (const ext of ['js', 'sql']) {
+    await fs.promises.unlink(path.join(initScriptDir(), `${containerName}.${ext}`)).catch((err) => {
+      if (err.code !== 'ENOENT') throw err;
+    });
+  }
 }
 
 async function imageExists(image) {
@@ -60,9 +75,9 @@ async function ensureImage(image) {
 
 // routing: "nginx"  → no host port binding, container only on customdb-network
 // routing: "direct" → legacy behavior, container publishes its port on host
-function buildHostConfig({ internalPort, port, bindPath, routing }) {
+function buildHostConfig({ internalPort, port, bindPath, routing, extraBinds = [] }) {
   const cfg = {
-    Binds: [bindPath],
+    Binds: [bindPath, ...extraBinds],
     RestartPolicy: { Name: 'unless-stopped' },
   };
   if (routing === 'direct') {
@@ -83,12 +98,30 @@ async function createMongoContainer({ userId, dbName, port, username, password, 
   const { containerName: name, dataDir } = deriveNames({ type: 'nosql', dbName, userId });
   ensureDataDir(dataDir);
 
+  // The root user below is a throwaway bootstrap credential — never stored or
+  // handed to the customer. It only exists so Mongo's entrypoint can enable
+  // --auth and run the init script once (on a fresh data dir) to create the
+  // customer-facing user scoped to just `dbName` (not root over the whole
+  // container). This is what stops a stray external connection from silently
+  // creating sibling databases (e.g. "public", "defaultdb") that CustomDB
+  // never sees.
+  const rootUser = `root_${randomToken(6)}`;
+  const rootPass = randomToken(24);
+  const initFile = path.join(initScriptDir(), `${name}.js`);
+  await fs.promises.writeFile(initFile, [
+    `db.getSiblingDB('${dbName}').createUser({`,
+    `  user: '${username}',`,
+    `  pwd: '${password}',`,
+    `  roles: [{ role: 'dbOwner', db: '${dbName}' }],`,
+    `});`,
+  ].join('\n'));
+
   const container = await docker.createContainer({
     Image: MONGO_IMAGE,
     name,
     Env: [
-      `MONGO_INITDB_ROOT_USERNAME=${username}`,
-      `MONGO_INITDB_ROOT_PASSWORD=${password}`,
+      `MONGO_INITDB_ROOT_USERNAME=${rootUser}`,
+      `MONGO_INITDB_ROOT_PASSWORD=${rootPass}`,
     ],
     Labels: {
       'customdb.managed': 'true',
@@ -97,7 +130,10 @@ async function createMongoContainer({ userId, dbName, port, username, password, 
       'customdb.userId': userId || '',
       'customdb.routing': routing,
     },
-    HostConfig: buildHostConfig({ internalPort: 27017, port, bindPath: `${dataDir}:/data/db`, routing }),
+    HostConfig: buildHostConfig({
+      internalPort: 27017, port, bindPath: `${dataDir}:/data/db`, routing,
+      extraBinds: [`${initFile}:/docker-entrypoint-initdb.d/init-user.js:ro`],
+    }),
     NetworkingConfig: buildNetworkingConfig(routing),
     ExposedPorts: { '27017/tcp': {} },
   });
@@ -111,12 +147,28 @@ async function createPostgresContainer({ userId, dbName, port, username, passwor
   const { containerName: name, dataDir } = deriveNames({ type: 'sql', dbName, userId });
   ensureDataDir(dataDir);
 
+  // Same reasoning as createMongoContainer: POSTGRES_USER below is a
+  // throwaway bootstrap superuser, never handed to the customer. The init
+  // script (run once, only on a fresh data dir) creates the real
+  // customer-facing role as the OWNER of just `dbName` — a plain role
+  // without CREATEDB/SUPERUSER, so it can't create sibling databases in this
+  // same container the way a superuser could.
+  const rootUser = `root_${randomToken(6)}`;
+  const rootPass = randomToken(24);
+  const initFile = path.join(initScriptDir(), `${name}.sql`);
+  await fs.promises.writeFile(initFile, [
+    `CREATE USER "${username}" WITH PASSWORD '${password}';`,
+    `GRANT ALL PRIVILEGES ON DATABASE "${dbName}" TO "${username}";`,
+    `ALTER DATABASE "${dbName}" OWNER TO "${username}";`,
+    `GRANT ALL ON SCHEMA public TO "${username}";`,
+  ].join('\n'));
+
   const container = await docker.createContainer({
     Image: POSTGRES_IMAGE,
     name,
     Env: [
-      `POSTGRES_USER=${username}`,
-      `POSTGRES_PASSWORD=${password}`,
+      `POSTGRES_USER=${rootUser}`,
+      `POSTGRES_PASSWORD=${rootPass}`,
       `POSTGRES_DB=${dbName}`,
     ],
     Labels: {
@@ -126,7 +178,10 @@ async function createPostgresContainer({ userId, dbName, port, username, passwor
       'customdb.userId': userId || '',
       'customdb.routing': routing,
     },
-    HostConfig: buildHostConfig({ internalPort: 5432, port, bindPath: `${dataDir}:/var/lib/postgresql/data`, routing }),
+    HostConfig: buildHostConfig({
+      internalPort: 5432, port, bindPath: `${dataDir}:/var/lib/postgresql/data`, routing,
+      extraBinds: [`${initFile}:/docker-entrypoint-initdb.d/init-user.sql:ro`],
+    }),
     NetworkingConfig: buildNetworkingConfig(routing),
     ExposedPorts: { '5432/tcp': {} },
   });
@@ -243,5 +298,6 @@ module.exports = {
   resolveNames,
   getDirectorySize,
   removeDataDir,
+  removeInitScript,
   deriveNames,
 };
