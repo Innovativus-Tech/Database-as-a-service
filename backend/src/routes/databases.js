@@ -125,13 +125,16 @@ router.post('/create', requireAuth, async (req, res, next) => {
   const routing = 'nginx';
   const { containerName } = deriveNames({ type, dbName: name, userId: req.user.id });
 
+  // Both engines now ship with TLS by default. Mongo terminates at nginx
+  // (immediate TLS handshake on the wire); Postgres terminates inside its
+  // own container (handles its STARTTLS-style upgrade dance natively).
+  // Declared outside the try blocks so both the prisma.create and the
+  // subsequent provisioning step (which run in separate try/catch scopes)
+  // can see it.
+  const tlsEnabled = true;
+
   let database;
   try {
-    // Both engines now ship with TLS by default. Mongo terminates at nginx
-    // (immediate TLS handshake on the wire); Postgres terminates inside its
-    // own container (handles its STARTTLS-style upgrade dance natively).
-    // The nginxManager picks the right per-type placement automatically.
-    const tlsEnabled = true;
     database = await prisma.database.create({
       data: {
         userId: req.user.id,
