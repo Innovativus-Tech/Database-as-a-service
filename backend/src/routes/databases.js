@@ -398,6 +398,7 @@ router.get('/:id/schemas', requireAuth, async (req, res) => {
 
     res.json({ schemas, type: db.type, primary: db.type === 'nosql' ? db.dbName : 'public' });
   } catch (err) {
+    console.error('[databases/:id/schemas]', err.code || err.name, err.message);
     const status = err.status || 500;
     res.status(status).json({ error: err.message || 'Failed to list schemas' });
   }
@@ -482,6 +483,7 @@ router.get('/:id/collections', requireAuth, async (req, res, next) => {
 
     res.json({ collections, type: db.type, schema });
   } catch (err) {
+    console.error('[databases/:id/collections]', err.code || err.name, err.message);
     const status = err.status || 500;
     res.status(status).json({ error: err.message || 'Failed to list collections' });
   }

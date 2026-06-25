@@ -82,7 +82,12 @@ async function ensureImage(image) {
 // many user databases; override per env if you have a beefier host. Values
 // are intentionally conservative: one tenant running a runaway aggregation
 // can only burn its own quota, never starve the host or the platform DB.
-const USER_DB_MEMORY_MB = Number(process.env.USER_DB_MEMORY_MB || 512);
+//
+// 1GB default chosen so Mongo 7.0 can comfortably boot with its WiredTiger
+// cache + replication state + connection pool overhead. 512MB was too tight
+// in practice — Mongo's cold-start memory spike crossed it and the container
+// got OOM-killed silently mid-init.
+const USER_DB_MEMORY_MB = Number(process.env.USER_DB_MEMORY_MB || 1024);
 const USER_DB_CPU_QUOTA = Number(process.env.USER_DB_CPU_QUOTA || 0.5); // fraction of one CPU
 const USER_DB_PIDS_LIMIT = Number(process.env.USER_DB_PIDS_LIMIT || 200);
 const MONGO_WT_CACHE_GB = Number(process.env.MONGO_WT_CACHE_GB || 0.25);
