@@ -69,7 +69,7 @@ async function bootstrap() {
     }
 
     const n = await syncFromDatabaseRows(rows.map((r) => ({
-      port: r.port, type: r.type, routing: r.routing, containerName: r.containerName,
+      port: r.port, type: r.type, routing: r.routing, containerName: r.containerName, tlsEnabled: r.tlsEnabled,
     })));
     if (n > 0) await reloadNginx();
     console.log(`[bootstrap] synced ${n} nginx stream blocks`);

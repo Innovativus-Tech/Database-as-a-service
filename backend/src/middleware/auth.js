@@ -1,6 +1,16 @@
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const prisma = require('../prisma');
+const { cache } = require('../services/cache');
+
+const SESSION_CACHE_TTL_MS = 30_000;
+const LAST_SEEN_THROTTLE_MS = 60_000;
+const lastSeenSentAt = new Map(); // jti -> last write timestamp
+
+function invalidateSession(jti) {
+  cache.invalidate(`session:${jti}`);
+  lastSeenSentAt.delete(jti);
+}
 
 async function requireAuth(req, res, next) {
   const header = req.headers.authorization || '';
@@ -14,16 +24,27 @@ async function requireAuth(req, res, next) {
     const payload = jwt.verify(token, process.env.JWT_SECRET);
     if (!payload.jti) return res.status(401).json({ error: 'Invalid or expired token' });
 
-    const session = await prisma.session.findUnique({ where: { jti: payload.jti } });
+    // Burst of API calls for the same session = one Postgres lookup per 30s,
+    // not one per request. Revocation (logout, password change, kick) calls
+    // invalidateSession() to drop the cache immediately.
+    const session = await cache.getOrLoad(`session:${payload.jti}`, SESSION_CACHE_TTL_MS, () =>
+      prisma.session.findUnique({ where: { jti: payload.jti } })
+    );
     if (!session || session.revokedAt) {
+      cache.invalidate(`session:${payload.jti}`);
       return res.status(401).json({ error: 'Session has been revoked' });
     }
 
-    // Best-effort, fire-and-forget — don't block the request on this write.
-    prisma.session.update({
-      where: { jti: payload.jti },
-      data: { lastSeenAt: new Date() },
-    }).catch(() => {});
+    // Throttle the lastSeenAt write to once-per-minute per session. Was
+    // firing on every request, generating one Postgres UPDATE per API call.
+    const lastWrite = lastSeenSentAt.get(payload.jti) || 0;
+    if (Date.now() - lastWrite > LAST_SEEN_THROTTLE_MS) {
+      lastSeenSentAt.set(payload.jti, Date.now());
+      prisma.session.update({
+        where: { jti: payload.jti },
+        data: { lastSeenAt: new Date() },
+      }).catch(() => {});
+    }
 
     req.user = { id: payload.sub, email: payload.email };
     req.sessionJti = payload.jti;
@@ -56,4 +77,4 @@ async function createSession(user, req) {
   return signToken(user, jti);
 }
 
-module.exports = { requireAuth, signToken, createSession };
+module.exports = { requireAuth, signToken, createSession, invalidateSession };

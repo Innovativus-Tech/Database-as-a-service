@@ -36,8 +36,13 @@ function initScriptDir() {
 // Removes the one-off init script (if any) left behind for a container. Safe
 // to call even if neither extension exists (e.g. legacy root-scoped DBs).
 async function removeInitScript(containerName) {
-  for (const ext of ['js', 'sql']) {
-    await fs.promises.unlink(path.join(initScriptDir(), `${containerName}.${ext}`)).catch((err) => {
+  const candidates = [
+    `${containerName}.js`,
+    `${containerName}.sql`,
+    `${containerName}-ssl.sh`,
+  ];
+  for (const f of candidates) {
+    await fs.promises.unlink(path.join(initScriptDir(), f)).catch((err) => {
       if (err.code !== 'ENOENT') throw err;
     });
   }
@@ -73,12 +78,25 @@ async function ensureImage(image) {
   }
 }
 
+// Per-container resource caps. Defaults are tuned for a small VPS hosting
+// many user databases; override per env if you have a beefier host. Values
+// are intentionally conservative: one tenant running a runaway aggregation
+// can only burn its own quota, never starve the host or the platform DB.
+const USER_DB_MEMORY_MB = Number(process.env.USER_DB_MEMORY_MB || 512);
+const USER_DB_CPU_QUOTA = Number(process.env.USER_DB_CPU_QUOTA || 0.5); // fraction of one CPU
+const USER_DB_PIDS_LIMIT = Number(process.env.USER_DB_PIDS_LIMIT || 200);
+const MONGO_WT_CACHE_GB = Number(process.env.MONGO_WT_CACHE_GB || 0.25);
+
 // routing: "nginx"  → no host port binding, container only on customdb-network
 // routing: "direct" → legacy behavior, container publishes its port on host
 function buildHostConfig({ internalPort, port, bindPath, routing, extraBinds = [] }) {
   const cfg = {
     Binds: [bindPath, ...extraBinds],
     RestartPolicy: { Name: 'unless-stopped' },
+    Memory: USER_DB_MEMORY_MB * 1024 * 1024,
+    MemorySwap: USER_DB_MEMORY_MB * 1024 * 1024, // disable swap, OOM cleanly
+    NanoCpus: Math.round(USER_DB_CPU_QUOTA * 1e9),
+    PidsLimit: USER_DB_PIDS_LIMIT,
   };
   if (routing === 'direct') {
     cfg.PortBindings = { [`${internalPort}/tcp`]: [{ HostPort: String(port) }] };
@@ -125,6 +143,19 @@ async function createMongoContainer({ userId, dbName, port, username, password, 
   const container = await docker.createContainer({
     Image: MONGO_IMAGE,
     name,
+    // Mongo defaults to 50% of system RAM for its WiredTiger cache. With many
+    // containers on one host that's catastrophic over-subscription, and
+    // Docker's memory cgroup limit alone doesn't fix it (Mongo will get OOM
+    // killed instead of self-throttling). Cap the cache explicitly here so
+    // each container's footprint stays inside its allotted Memory cap.
+    Cmd: ['mongod', '--auth', '--bind_ip_all', '--wiredTigerCacheSizeGB', String(MONGO_WT_CACHE_GB)],
+    Healthcheck: {
+      Test: ['CMD', 'mongosh', '--quiet', '--eval', "db.adminCommand('ping').ok"],
+      Interval: 30_000_000_000, // 30s in nanoseconds
+      Timeout:  5_000_000_000,
+      Retries:  3,
+      StartPeriod: 20_000_000_000,
+    },
     Env: [
       `MONGO_INITDB_ROOT_USERNAME=${rootUser}`,
       `MONGO_INITDB_ROOT_PASSWORD=${rootPass}`,
@@ -169,9 +200,61 @@ async function createPostgresContainer({ userId, dbName, port, username, passwor
     `GRANT ALL ON SCHEMA public TO "${username}";`,
   ].join('\n'));
 
+  // SSL bootstrap script — runs once on a fresh data dir, BEFORE init-user.sql
+  // (filename prefixed `00-` to come first alphabetically in the entrypoint's
+  // run order). Generates a self-signed cert as the postgres user, writes it
+  // into PGDATA (so default ssl_cert_file/ssl_key_file paths find it), sets
+  // the 0600 permission Postgres requires on the key, and writes `ssl = on`
+  // to postgresql.auto.conf so the long-running server picks it up.
+  //
+  // Note: we DON'T pass `-c ssl=on` in Cmd, because the postgres entrypoint
+  // applies Cmd args to the temp init-time server too — that server would
+  // refuse to start (cert doesn't exist yet), and the init scripts would
+  // never run. postgresql.auto.conf is read only by the long-running server.
+  //
+  // The TLS handshake is genuine Postgres SSL (handles its own STARTTLS
+  // upgrade), so nginx in front can stay a pure TCP passthrough — no `ssl on`
+  // directive at the nginx layer.
+  const sslInitFile = path.join(initScriptDir(), `${name}-ssl.sh`);
+  await fs.promises.writeFile(sslInitFile, [
+    `#!/bin/sh`,
+    `set -e`,
+    `openssl req -new -x509 -days 3650 -nodes \\`,
+    `  -out "$PGDATA/server.crt" \\`,
+    `  -keyout "$PGDATA/server.key" \\`,
+    `  -subj "/CN=customdb-pg-self-signed"`,
+    `chmod 600 "$PGDATA/server.key"`,
+    `chown postgres:postgres "$PGDATA/server.crt" "$PGDATA/server.key"`,
+    `echo "ssl = on" >> "$PGDATA/postgresql.auto.conf"`,
+  ].join('\n'));
+  await fs.promises.chmod(sslInitFile, 0o755);
+
+  // Tune Postgres caches to fit inside the per-container Memory budget.
+  // shared_buffers ≈ 25% of container RAM, effective_cache_size ≈ 50%, both
+  // expressed in MB. Without this, Postgres assumes it owns all host RAM
+  // and over-caches across containers, leading to OOM kills under load.
+  const pgSharedBuffersMB  = Math.max(32, Math.floor(USER_DB_MEMORY_MB * 0.25));
+  const pgEffectiveCacheMB = Math.max(64, Math.floor(USER_DB_MEMORY_MB * 0.50));
+
   const container = await docker.createContainer({
     Image: POSTGRES_IMAGE,
     name,
+    Cmd: [
+      'postgres',
+      '-c', `shared_buffers=${pgSharedBuffersMB}MB`,
+      '-c', `effective_cache_size=${pgEffectiveCacheMB}MB`,
+      '-c', 'max_connections=100',
+      // ssl=on is set in postgresql.auto.conf by the SSL init script, not here.
+      // The entrypoint applies Cmd to its temp init server too, which would
+      // crash before the cert exists.
+    ],
+    Healthcheck: {
+      Test: ['CMD-SHELL', `pg_isready -U "${rootUser}" -d "${dbName}"`],
+      Interval: 30_000_000_000,
+      Timeout:  5_000_000_000,
+      Retries:  3,
+      StartPeriod: 20_000_000_000,
+    },
     Env: [
       `POSTGRES_USER=${rootUser}`,
       `POSTGRES_PASSWORD=${rootPass}`,
@@ -186,7 +269,10 @@ async function createPostgresContainer({ userId, dbName, port, username, passwor
     },
     HostConfig: buildHostConfig({
       internalPort: 5432, port, bindPath: `${dataDir}:/var/lib/postgresql/data`, routing,
-      extraBinds: [`${initFile}:/docker-entrypoint-initdb.d/init-user.sql:ro`],
+      extraBinds: [
+        `${sslInitFile}:/docker-entrypoint-initdb.d/00-init-ssl.sh:ro`,
+        `${initFile}:/docker-entrypoint-initdb.d/init-user.sql:ro`,
+      ],
     }),
     NetworkingConfig: buildNetworkingConfig(routing),
     ExposedPorts: { '5432/tcp': {} },

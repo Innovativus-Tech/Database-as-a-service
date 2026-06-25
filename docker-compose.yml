@@ -94,6 +94,14 @@ services:
       - "5433-5532:5433-5532"
     networks: [customdb-network]
     restart: unless-stopped
+    # Default ulimit (1024) caps the proxy to ~512 effective concurrent
+    # connections — visible as "4096 worker_connections exceed open file
+    # resource limit: 1024" in nginx logs. Bumping nofile lets the proxy
+    # actually use its configured worker_connections under real load.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
 
 volumes:
   meta-db-data:

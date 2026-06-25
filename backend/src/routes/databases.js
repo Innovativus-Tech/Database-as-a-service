@@ -21,6 +21,7 @@ const {
   deriveNames,
 } = require('../services/provisioning');
 const { dispatchImport } = require('../services/dataImport');
+const { cache } = require('../services/cache');
 const { createJob: createImportJob, getJob: getImportJob, updateJob: updateImportJob, scheduleCleanup: scheduleImportJobCleanup } = require('../services/importJobs');
 const { FREE_DB_LIMIT } = require('./auth');
 const { addStreamBlock, removeStreamBlock, reloadNginx } = require('../services/nginxManager');
@@ -90,6 +91,7 @@ function publicShape(db) {
     port: db.port,
     status: db.status,
     storageUsed: Number(db.storageUsed),
+    tlsEnabled: !!db.tlsEnabled,
     createdAt: db.createdAt,
     lastConnectedAt: db.lastConnectedAt,
   };
@@ -125,6 +127,11 @@ router.post('/create', requireAuth, async (req, res, next) => {
 
   let database;
   try {
+    // Both engines now ship with TLS by default. Mongo terminates at nginx
+    // (immediate TLS handshake on the wire); Postgres terminates inside its
+    // own container (handles its STARTTLS-style upgrade dance natively).
+    // The nginxManager picks the right per-type placement automatically.
+    const tlsEnabled = true;
     database = await prisma.database.create({
       data: {
         userId: req.user.id,
@@ -135,6 +142,7 @@ router.post('/create', requireAuth, async (req, res, next) => {
         status: 'provisioning',
         containerName,
         routing,
+        tlsEnabled,
         credentials: {
           create: { username, passwordEncrypted: encrypt(password) },
         },
@@ -153,7 +161,7 @@ router.post('/create', requireAuth, async (req, res, next) => {
 
     // Add nginx stream block + reload, so clients can reach the new container.
     const internalPort = type === 'nosql' ? 27017 : 5432;
-    await addStreamBlock({ port, containerName, internalPort });
+    await addStreamBlock({ port, containerName, internalPort, tlsEnabled, type });
     await reloadNginx();
 
     const updated = await prisma.database.update({
@@ -161,7 +169,7 @@ router.post('/create', requireAuth, async (req, res, next) => {
       data: { status: 'active' },
     });
 
-    const connectionUrl = generateConnectionURL(type, { host, port, username, password, dbName: name });
+    const connectionUrl = generateConnectionURL(type, { host, port, username, password, dbName: name, tls: tlsEnabled });
 
     res.status(201).json({
       database: publicShape(updated),
@@ -221,6 +229,7 @@ router.get('/:id', requireAuth, async (req, res, next) => {
       username: cred.username,
       password,
       dbName: db.dbName,
+      tls: !!db.tlsEnabled,
     });
 
     res.json({
@@ -245,13 +254,28 @@ router.get('/:id/stats', requireAuth, async (req, res, next) => {
     if (!db) return res.status(404).json({ error: 'Database not found' });
 
     const { containerName, dataDir } = resolveNames(db);
-    const inspect = await inspectContainer(containerName);
-    const storageBytes = await getDirectorySize(dataDir);
 
-    await prisma.database.update({
-      where: { id: db.id },
-      data: { storageUsed: BigInt(storageBytes) },
-    });
+    // The disk walk is by far the most expensive thing per request — for a
+    // multi-GB Mongo data dir it can take seconds and the result barely
+    // changes minute-to-minute. Cache it for 30s. Concurrent /stats calls
+    // for the same database collapse to one walk (getOrLoad dedupes).
+    const inspect = await cache.getOrLoad(
+      `inspect:${containerName}`, 5_000,
+      () => inspectContainer(containerName)
+    );
+    const storageBytes = await cache.getOrLoad(
+      `storage:${db.id}`, 30_000,
+      () => getDirectorySize(dataDir)
+    );
+
+    // Persist the freshly measured size — but only when we actually re-walked.
+    // Throttling via the cache means we don't UPDATE Postgres every poll.
+    if (Number(db.storageUsed) !== storageBytes) {
+      prisma.database.update({
+        where: { id: db.id },
+        data: { storageUsed: BigInt(storageBytes) },
+      }).catch(() => {});
+    }
 
     res.json({
       id: db.id,
@@ -293,7 +317,7 @@ router.post('/:id/start', requireAuth, async (req, res, next) => {
 
     if (db.routing === 'nginx' && db.containerName) {
       const internalPort = db.type === 'nosql' ? 27017 : 5432;
-      await addStreamBlock({ port: db.port, containerName: db.containerName, internalPort });
+      await addStreamBlock({ port: db.port, containerName: db.containerName, internalPort, tlsEnabled: !!db.tlsEnabled, type: db.type });
       await reloadNginx();
     }
 
@@ -319,10 +343,13 @@ async function loadDatabaseWithUrl(userId, id) {
 
   const connectionUrl = generateConnectionURL(db.type, {
     host: db.host, port: db.port, username: cred.username, password, dbName: db.dbName,
+    tls: !!db.tlsEnabled, // public URL → through nginx → TLS terminates at proxy
   });
 
   // For nginx-routed DBs we have the container name + the internal port (27017 / 5432).
   // For legacy direct-bind DBs containerName may be null; fall back to the public URL.
+  // Internal hop is plaintext: it stays on the private customdb-network and
+  // talks straight to the user-DB container, bypassing the nginx TLS layer.
   let internalUrl = connectionUrl;
   if (db.routing === 'nginx' && db.containerName) {
     const internalPort = db.type === 'nosql' ? 27017 : 5432;
@@ -332,6 +359,7 @@ async function loadDatabaseWithUrl(userId, id) {
       username: cred.username,
       password,
       dbName: db.dbName,
+      tls: false,
     });
   }
 
@@ -637,17 +665,21 @@ router.post('/:id/import', requireAuth, upload.single('file'), async (req, res, 
     // must reach the user DB via internal Docker DNS (container name on the
     // customdb-network), not the public URL which doesn't route from inside.
     // .zip and .sql imports use docker exec, so they don't need a network URL.
+    // Internal hop is always plaintext (skips the nginx TLS layer); only the
+    // public path through the proxy needs TLS for new (tlsEnabled) DBs.
     let connectionUrl;
     if (db.routing === 'nginx' && db.containerName) {
       const internalPort = db.type === 'nosql' ? 27017 : 5432;
       connectionUrl = generateConnectionURL(db.type, {
         host: db.containerName, port: internalPort,
         username: cred.username, password, dbName: db.dbName,
+        tls: false,
       });
     } else {
       connectionUrl = generateConnectionURL(db.type, {
         host: db.host, port: db.port,
         username: cred.username, password, dbName: db.dbName,
+        tls: !!db.tlsEnabled,
       });
     }
 
@@ -727,6 +759,9 @@ router.delete('/:id', requireAuth, async (req, res, next) => {
 
     // Cascade removes credentials too.
     await prisma.database.delete({ where: { id: db.id } });
+
+    cache.invalidate(`inspect:${containerName}`);
+    cache.invalidate(`storage:${db.id}`);
 
     res.json({ ok: true, deleted: { id: db.id, name: db.dbName } });
   } catch (err) {

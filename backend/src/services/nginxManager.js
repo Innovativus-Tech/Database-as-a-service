@@ -17,16 +17,30 @@ function configPath(port) {
   return path.join(streamDir(), `customdb-${port}.conf`);
 }
 
-function blockText({ port, containerName, internalPort }) {
+function blockText({ port, containerName, internalPort, tlsEnabled = false, type = 'nosql' }) {
   // proxy_pass target MUST live in a variable, not a bare literal — nginx
   // resolves a literal hostname once at config-load time, and if that one
   // container is down, the whole nginx process fails to start/reload,
   // breaking routing for every other database. Holding it in a variable
   // defers resolution to connection time via the `resolver` directive, so a
   // single dead container only breaks its own route.
-  return `# customdb stream block for port ${port}
+  //
+  // TLS placement depends on the protocol:
+  //   - Mongo (type === 'nosql'): terminate at nginx using the baked-in
+  //     self-signed cert. Mongo's TLS handshake is immediate (TLS ClientHello
+  //     is the first bytes on the wire), so nginx `ssl on` works.
+  //   - Postgres (type === 'sql'): nginx stays a pure TCP passthrough; TLS
+  //     terminates inside the Postgres container itself. Postgres uses a
+  //     STARTTLS-style upgrade dance (plaintext SSLRequest packet → server
+  //     responds 'S' → TLS handshake) which nginx `ssl on` can't speak.
+  const nginxTerminatesTls = tlsEnabled && type === 'nosql';
+  const sslDirectives = nginxTerminatesTls ? `
+  ssl_certificate     /etc/nginx/tls/customdb.crt;
+  ssl_certificate_key /etc/nginx/tls/customdb.key;` : '';
+  const tlsTag = tlsEnabled ? (nginxTerminatesTls ? ' (TLS at nginx)' : ' (TLS in container)') : '';
+  return `# customdb stream block for port ${port}${tlsTag}
 server {
-  listen ${port};
+  listen ${port}${nginxTerminatesTls ? ' ssl' : ''};${sslDirectives}
   set $upstream_${port} ${containerName};
   proxy_pass $upstream_${port}:${internalPort};
   proxy_connect_timeout 5s;
@@ -39,9 +53,9 @@ function ensureStreamDir() {
   fs.mkdirSync(streamDir(), { recursive: true });
 }
 
-async function addStreamBlock({ port, containerName, internalPort }) {
+async function addStreamBlock({ port, containerName, internalPort, tlsEnabled = false, type = 'nosql' }) {
   ensureStreamDir();
-  await fs.promises.writeFile(configPath(port), blockText({ port, containerName, internalPort }), 'utf8');
+  await fs.promises.writeFile(configPath(port), blockText({ port, containerName, internalPort, tlsEnabled, type }), 'utf8');
 }
 
 async function removeStreamBlock(port) {
@@ -79,7 +93,7 @@ async function syncFromDatabaseRows(rows) {
   for (const r of rows) {
     if (r.routing !== 'nginx' || !r.containerName) continue;
     const internalPort = r.type === 'nosql' ? 27017 : 5432;
-    await addStreamBlock({ port: r.port, containerName: r.containerName, internalPort });
+    await addStreamBlock({ port: r.port, containerName: r.containerName, internalPort, tlsEnabled: !!r.tlsEnabled, type: r.type });
   }
   return rows.filter((r) => r.routing === 'nginx').length;
 }

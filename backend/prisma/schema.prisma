@@ -76,6 +76,7 @@ model Database {
   storageUsed     BigInt         @default(0)
   containerName   String?        @unique
   routing         String?        // null = legacy direct port binding; "nginx" = via nginx proxy
+  tlsEnabled      Boolean        @default(false) // existing rows stay plaintext; new rows pass true explicitly
   createdAt       DateTime       @default(now())
   lastConnectedAt DateTime?
 

@@ -3,7 +3,7 @@ const bcrypt = require('bcrypt');
 const { authenticator } = require('otplib');
 const qrcode = require('qrcode');
 const prisma = require('../prisma');
-const { createSession, requireAuth } = require('../middleware/auth');
+const { createSession, requireAuth, invalidateSession } = require('../middleware/auth');
 const {
   stopAndRemoveContainer,
   removeDataDir,
@@ -161,10 +161,15 @@ router.post('/password', requireAuth, async (req, res, next) => {
     await prisma.user.update({ where: { id: user.id }, data: { passwordHash } });
 
     // Changing your password should kick out every other signed-in device.
+    const otherSessions = await prisma.session.findMany({
+      where: { userId: user.id, jti: { not: req.sessionJti }, revokedAt: null },
+      select: { jti: true },
+    });
     await prisma.session.updateMany({
       where: { userId: user.id, jti: { not: req.sessionJti }, revokedAt: null },
       data: { revokedAt: new Date() },
     });
+    for (const s of otherSessions) invalidateSession(s.jti);
 
     res.json({ ok: true });
   } catch (err) {
@@ -201,6 +206,7 @@ router.delete('/sessions/:id', requireAuth, async (req, res, next) => {
     const session = await prisma.session.findFirst({ where: { id: req.params.id, userId: req.user.id } });
     if (!session) return res.status(404).json({ error: 'Session not found' });
     await prisma.session.update({ where: { id: session.id }, data: { revokedAt: new Date() } });
+    invalidateSession(session.jti);
     res.json({ ok: true });
   } catch (err) {
     next(err);
