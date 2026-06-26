@@ -8,6 +8,20 @@
 #  - The meta DB and per-user data volumes are stored under ./var on the host.
 
 services:
+  # The two platform services below (meta-db + backend) are CRITICAL —
+  # if either dies, customers can't log in. These get hardware-level
+  # priority over user DB containers via the cgroup knobs below.
+  #
+  # - oom_score_adj=-900 makes the kernel OOM killer pick literally any
+  #   other process before these two. User DB containers default to
+  #   adj=0; with this set to -900, platform services survive memory
+  #   pressure that would have killed them before.
+  # - mem_reservation guarantees these services have minimum RAM
+  #   actually reserved by the kernel — not just a hard cap.
+  # - cpu_shares=2048 (default is 1024) means under CPU contention,
+  #   platform services get 2x more CPU time than each user DB.
+  #   Combined with the BlkioWeight=100 on user DB containers (provisioning.js),
+  #   the platform always wins for both CPU and disk I/O.
   meta-db:
     image: postgres:16
     container_name: customdb-meta
@@ -23,6 +37,9 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+    mem_reservation: 512m
+    cpu_shares: 2048
+    oom_score_adj: -900
 
   backend:
     build: ./backend
@@ -65,6 +82,9 @@ services:
       # for data browser / import (drivers use the internal Docker DNS).
       - customdb-network
     restart: unless-stopped
+    mem_reservation: 512m
+    cpu_shares: 2048
+    oom_score_adj: -900
 
   frontend:
     build:

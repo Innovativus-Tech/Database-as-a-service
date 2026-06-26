@@ -102,6 +102,16 @@ function buildHostConfig({ internalPort, port, bindPath, routing, extraBinds = [
     MemorySwap: USER_DB_MEMORY_MB * 1024 * 1024, // disable swap, OOM cleanly
     NanoCpus: Math.round(USER_DB_CPU_QUOTA * 1e9),
     PidsLimit: USER_DB_PIDS_LIMIT,
+    // Disk I/O priority. 100 (of 1000 default) means user DB containers get
+    // 1/10 the disk bandwidth weight of normal processes when disk is
+    // contended. Critical for keeping login + meta-DB responsive while one
+    // tenant runs a heavy bulk import. On idle disk this has zero effect —
+    // it only kicks in under contention. Docker translates this to io.weight
+    // on cgroup v2 systems automatically.
+    BlkioWeight: 100,
+    // CPU scheduling priority. Same idea, applied to CPU time: when both
+    // platform and a user DB are competing for CPU, the user DB gets less.
+    CpuShares: 256, // default is 1024
   };
   if (routing === 'direct') {
     cfg.PortBindings = { [`${internalPort}/tcp`]: [{ HostPort: String(port) }] };
