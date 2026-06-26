@@ -112,7 +112,10 @@ services:
   # - Same hardware-isolation treatment as the platform DBs: memory reservation,
   #   OOM protection just below platform, CPU shares above user DBs.
   # Connection from inside customdb-network: redis://customdb-redis:6379
-  # Connection from outside (your consumer apps): redis://default:<PASSWORD>@dbaas.innovativus.tech:6379
+  # Connection from outside (your consumer apps): redis://default:<PASSWORD>@dbaas.innovativus.tech:6380
+  # External port is 6380 because port 6379 on this VPS is already used by
+  # another project (PivotDB). Inside the container Redis still listens on
+  # its default 6379, so internal callers use the standard port.
   redis:
     image: redis:7-alpine
     container_name: customdb-redis
@@ -129,7 +132,7 @@ services:
     volumes:
       - redis-data:/data
     ports:
-      - "6379:6379"
+      - "6380:6379"
     networks:
       - customdb-network
     restart: unless-stopped
