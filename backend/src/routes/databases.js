@@ -44,6 +44,7 @@ const {
   deletePostgresRow,
   createPostgresTable,
   dropPostgresTable,
+  evictPoolsForHost,
   PG_COLUMN_TYPES,
 } = require('../services/dataBrowser');
 
@@ -767,6 +768,10 @@ router.delete('/:id', requireAuth, async (req, res, next) => {
     await prisma.database.delete({ where: { id: db.id } });
     cache.invalidate(`inspect:${containerName}`);
     cache.invalidate(`storage:${db.id}`);
+    cache.invalidate(`acl-provisioned:${db.id}`);
+    // Drop any pooled MongoClient/PgClient pointing at this now-dead container
+    // so background reconnect attempts don't keep retrying forever.
+    if (db.containerName) evictPoolsForHost(db.containerName).catch(() => {});
 
     res.json({ ok: true, deleted: { id: db.id, name: db.dbName } });
 

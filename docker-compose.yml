@@ -50,11 +50,15 @@ services:
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:4000/health || exit 1"]
-      interval: 10s
+      # Use /healthz (lightweight, no DB touch) NOT /health (touches Postgres).
+      # /health under load can take >5s and trigger the 3-strike restart cycle.
+      # /healthz only confirms the Node process is alive — exactly what the
+      # orchestrator needs.
+      test: ["CMD-SHELL", "wget -qO- http://localhost:4000/healthz || exit 1"]
+      interval: 15s
       timeout: 5s
-      retries: 3
-      start_period: 30s
+      retries: 5
+      start_period: 60s
     environment:
       DATABASE_URL: postgresql://customdb:${META_DB_PASSWORD:-customdb}@meta-db:5432/customdb_meta?schema=public
       JWT_SECRET: ${JWT_SECRET}

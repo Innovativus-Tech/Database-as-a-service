@@ -20,10 +20,18 @@ const crypto = require('crypto');
 const prisma = require('../prisma');
 const { decrypt } = require('../services/crypto');
 const { redis } = require('../services/redisClient');
+const { cache } = require('../services/cache');
 
 const router = express.Router();
 
 const REDIS_USER_PREFIX = 'rdb_';
+// Per-DB Redis ACL provisioning is deterministic and idempotent — once
+// done, it doesn't need to run again for the lifetime of the database.
+// Cache "provisioned" status in-memory so customer SDK calls (which can
+// happen on every cold-start of their app) don't run ACL SETUSER every
+// time. 5 minutes is long enough to absorb bursts; short enough that the
+// state self-heals after a Redis restart wipes ACL.
+const ACL_PROVISION_TTL_MS = 5 * 60_000;
 
 // HMAC-based deterministic password so we never need to store Redis creds.
 function deriveRedisPassword(dbId) {
@@ -125,12 +133,18 @@ router.get('/cache-config', async (req, res) => {
   const redisPassword = deriveRedisPassword(db.id);
   const keyPrefix = deriveKeyPrefix(db.id);
 
+  // Run ACL provisioning at most once every ACL_PROVISION_TTL_MS per DB.
+  // Burst of N customer SDK calls collapses to one ACL SETUSER round-trip
+  // (via getOrLoad's in-flight dedupe + TTL).
   try {
-    await ensureRedisUserExists({
-      username: redisUsername,
-      password: redisPassword,
-      keyPrefix,
-    });
+    await cache.getOrLoad(
+      `acl-provisioned:${db.id}`,
+      ACL_PROVISION_TTL_MS,
+      async () => {
+        await ensureRedisUserExists({ username: redisUsername, password: redisPassword, keyPrefix });
+        return true;
+      }
+    );
   } catch (err) {
     console.error('[cache-config] failed to provision Redis ACL user:', err.message);
     return res.status(503).json({ error: 'Cache service temporarily unavailable' });

@@ -21,6 +21,24 @@ app.get('/', (req, res) => {
   res.json({ service: 'customdb-backend', status: 'ok' });
 });
 
+// LIGHTWEIGHT liveness probe — for Coolify/Traefik/Docker healthcheck.
+// MUST NOT touch Postgres, Redis, Docker, or anything that can block.
+// If this 200s, the Node process is alive and able to serve requests.
+// That's all the container orchestrator needs to know.
+//
+// Reason this exists: a single endpoint that did `SELECT 1` against
+// Postgres caused cascading container restarts during heavy customer
+// migrations. When the meta-DB slowed down, the healthcheck timed out
+// (>5s), Coolify marked the container unhealthy after 3 strikes (30s),
+// killed and restarted it, and login was dead for 30-60s during the
+// restart. Migration kept running, the cycle repeated for hours.
+app.get('/healthz', (req, res) => {
+  res.json({ status: 'ok' });
+});
+
+// Deep health diagnostic — touches Postgres, intended for human use
+// (curl from the dashboard, monitoring tools, etc.). DO NOT use as
+// the container healthcheck.
 app.get('/health', async (req, res) => {
   try {
     await prisma.$queryRaw`SELECT 1`;
@@ -52,28 +70,35 @@ async function bootstrap() {
       include: { credentials: true },
     });
 
-    // Dockerode-created DB containers live outside Coolify's compose lifecycle
-    // (only the 4 compose-declared services are tracked), so they don't come
-    // back on their own after a host reboot or stack rebuild. Reconcile every
-    // active DB's container on every boot.
-    for (const db of rows) {
-      if (db.status !== 'active') continue;
-      try {
-        const cred = db.credentials[0];
-        if (!cred) continue;
-        const password = decrypt(cred.passwordEncrypted);
-        const action = await ensureContainerRunning({ db, username: cred.username, password });
-        if (action !== 'running') console.log(`[bootstrap] ${db.dbName}: container ${action}`);
-      } catch (err) {
-        console.error(`[bootstrap] failed to reconcile ${db.dbName}:`, err.message);
-      }
-    }
-
+    // Write nginx stream configs first — this is the fast part and unblocks
+    // customer database routing immediately. It doesn't depend on per-DB
+    // container reconciliation.
     const n = await syncFromDatabaseRows(rows.map((r) => ({
       port: r.port, type: r.type, routing: r.routing, containerName: r.containerName, tlsEnabled: r.tlsEnabled,
     })));
-    if (n > 0) await reloadNginx();
+    if (n > 0) await reloadNginx().catch(() => {});
     console.log(`[bootstrap] synced ${n} nginx stream blocks`);
+
+    // Reconciling user-DB containers is SLOW (docker inspect per DB, and
+    // recreating any that vanished can take seconds each). Don't block
+    // backend startup on this — kick it off as a detached background job
+    // so /healthz, /api/auth/login etc. are immediately serving requests
+    // while reconciliation runs.
+    setImmediate(async () => {
+      for (const db of rows) {
+        if (db.status !== 'active') continue;
+        try {
+          const cred = db.credentials[0];
+          if (!cred) continue;
+          const password = decrypt(cred.passwordEncrypted);
+          const action = await ensureContainerRunning({ db, username: cred.username, password });
+          if (action !== 'running') console.log(`[bootstrap:bg] ${db.dbName}: container ${action}`);
+        } catch (err) {
+          console.error(`[bootstrap:bg] failed to reconcile ${db.dbName}:`, err.message);
+        }
+      }
+      console.log('[bootstrap:bg] container reconciliation complete');
+    });
   } catch (err) {
     console.warn('[bootstrap] non-fatal init warning:', err.message);
   }

@@ -1,16 +1,64 @@
 const { MongoClient, ObjectId } = require('mongodb');
-const { Client: PgClient } = require('pg');
+const { Client: PgClient, Pool: PgPool } = require('pg');
+
+// Per-URL connection-pool reuse.
+//
+// Before this, every call to listMongoCollections / browseMongoCollection /
+// etc. created a fresh MongoClient (or new PgClient), did a TCP handshake +
+// auth, ran the query, and closed. The dashboard polls these endpoints from
+// multiple panels in parallel on every page navigation — each navigation
+// burned through ~10 handshakes per user DB, exhausting connection capacity
+// at the user DB AND making each backend request ~50-100ms slower than it
+// needed to be.
+//
+// Now: one shared MongoClient and one shared pg Pool per (URL) key,
+// kept alive for the process lifetime. Connections inside each client/pool
+// are still automatically managed by the driver.
+
+const mongoClients = new Map(); // url -> MongoClient (already connected)
+const pgPools      = new Map(); // url -> pg Pool
+
+function getMongoClient(connectionUrl) {
+  let client = mongoClients.get(connectionUrl);
+  if (client) return client;
+  client = new MongoClient(connectionUrl, {
+    serverSelectionTimeoutMS: 5000,
+    // The mongodb driver keeps an internal connection pool; we don't need
+    // to do anything to "reuse" — just keep one client around per URL.
+    maxPoolSize: 10,
+    minPoolSize: 0,
+  });
+  // connect() is idempotent on the same client — first call opens, subsequent
+  // ones are no-ops. We don't await here; the next driver op will await it.
+  client.connect().catch((err) => {
+    console.warn('[mongo] connect deferred for', connectionUrl.replace(/:[^:@/]+@/, ':***@'), '-', err.message);
+  });
+  mongoClients.set(connectionUrl, client);
+  return client;
+}
+
+function getPgPool(connectionUrl) {
+  let pool = pgPools.get(connectionUrl);
+  if (pool) return pool;
+  pool = new PgPool({
+    connectionString: connectionUrl,
+    connectionTimeoutMillis: 5000,
+    idleTimeoutMillis: 60_000, // recycle idle conns after a minute
+    max: 5,                    // cap per-user-DB connections from this process
+  });
+  pool.on('error', (err) => {
+    console.warn('[pg pool] background error for', connectionUrl.replace(/:[^:@/]+@/, ':***@'), '-', err.code || err.message);
+  });
+  pgPools.set(connectionUrl, pool);
+  return pool;
+}
 
 // MongoDB ──────────────────────────────────────────────────────────────────────
 
 async function withMongo(connectionUrl, fn) {
-  const client = new MongoClient(connectionUrl, { serverSelectionTimeoutMS: 5000 });
-  try {
-    await client.connect();
-    return await fn(client);
-  } finally {
-    await client.close().catch(() => {});
-  }
+  const client = getMongoClient(connectionUrl);
+  await client.connect(); // idempotent on already-connected client
+  return fn(client);
 }
 
 const MONGO_SYSTEM_DBS = new Set(['admin', 'config', 'local']);
@@ -119,12 +167,14 @@ function validIdent(name) { return typeof name === 'string' && PG_IDENT_RE.test(
 function qualify(schema, table) { return `"${schema}"."${table}"`; }
 
 async function withPg(connectionUrl, fn) {
-  const client = new PgClient({ connectionString: connectionUrl, connectionTimeoutMillis: 5000 });
-  await client.connect();
+  // Use a pooled client — the pool handles connect/release automatically.
+  // `client` here is a PoolClient with the same API as a Client.
+  const pool = getPgPool(connectionUrl);
+  const client = await pool.connect();
   try {
     return await fn(client);
   } finally {
-    await client.end().catch(() => {});
+    client.release();
   }
 }
 
@@ -286,6 +336,29 @@ async function dropPostgresTable({ connectionUrl, schema = 'public', table }) {
   });
 }
 
+// Drop any cached connections pointing at a given container host. Call this
+// when a user database is deleted so background reconnect attempts don't
+// keep retrying forever against a container that's been removed.
+// Matches by hostname inside the URL (credentials/db-name vary, host doesn't).
+async function evictPoolsForHost(hostname) {
+  if (!hostname) return;
+  const hostMatch = (url) => {
+    try { return new URL(url).hostname === hostname; } catch { return false; }
+  };
+  for (const [url, client] of mongoClients) {
+    if (hostMatch(url)) {
+      mongoClients.delete(url);
+      client.close().catch(() => {});
+    }
+  }
+  for (const [url, pool] of pgPools) {
+    if (hostMatch(url)) {
+      pgPools.delete(url);
+      pool.end().catch(() => {});
+    }
+  }
+}
+
 module.exports = {
   listMongoDatabases,
   createMongoDatabase,
@@ -305,5 +378,6 @@ module.exports = {
   deletePostgresRow,
   createPostgresTable,
   dropPostgresTable,
+  evictPoolsForHost,
   PG_COLUMN_TYPES,
 };
