@@ -32,6 +32,7 @@ app.get('/health', async (req, res) => {
 
 app.use('/api/auth', require('./routes/auth').router);
 app.use('/api/databases', require('./routes/databases'));
+app.use('/api', require('./routes/cacheConfig'));
 
 app.use((err, req, res, _next) => {
   console.error(err);

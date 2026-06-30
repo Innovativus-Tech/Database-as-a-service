@@ -47,6 +47,8 @@ services:
     depends_on:
       meta-db:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:4000/health || exit 1"]
       interval: 10s
@@ -67,6 +69,12 @@ services:
       CUSTOMDB_NETWORK: customdb-network
       NGINX_CONTAINER: customdb-nginx
       NGINX_STREAM_DIR: /etc/nginx/stream.d
+      # Internal Redis URL — backend talks to redis container on the
+      # customdb-network. Customer-facing host (for SDK use) is the public
+      # VPS host on the external port (6380).
+      REDIS_URL: redis://default:${REDIS_PASSWORD}@customdb-redis:6379
+      REDIS_PUBLIC_HOST: ${VPS_HOST}
+      REDIS_PUBLIC_PORT: 6380
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       # Mount host /data so the path is identical inside the backend AND when

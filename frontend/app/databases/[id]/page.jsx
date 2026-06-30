@@ -39,6 +39,7 @@ export default function DatabaseDetailPage() {
   const [error, setError] = useState(null);
   const [showPassword, setShowPassword] = useState(false);
   const [activeTab, setActiveTab] = useState('Overview');
+  const [urlFormat, setUrlFormat] = useState('sdk'); // 'sdk' or 'standard'
 
   const [importBusy, setImportBusy] = useState(false);
   const [importResult, setImportResult] = useState(null);
@@ -125,9 +126,17 @@ export default function DatabaseDetailPage() {
 
   const db = detail.database;
   const cred = detail.credentials;
-  const url = detail.connectionUrl;
-  const maskedUrl = url.replace(`:${encodeURIComponent(cred.password)}@`, ':••••••@');
+  const standardUrl = detail.connectionUrl;
   const isMongo = db.type === 'nosql';
+  // The SDK URL is the standard URL with the protocol swapped to customdb://
+  // (or customdb-pg://). The @customdb/client SDK parses this scheme,
+  // discovers the Redis cache config server-side, and provides transparent
+  // caching with the same query API as the underlying driver.
+  const sdkUrl = isMongo
+    ? standardUrl.replace(/^mongodb:\/\//, 'customdb://')
+    : standardUrl.replace(/^postgresql:\/\//, 'customdb-pg://');
+  const url = urlFormat === 'sdk' ? sdkUrl : standardUrl;
+  const maskedUrl = url.replace(`:${encodeURIComponent(cred.password)}@`, ':••••••@');
   const Icon = isMongo ? Leaf : Database;
   const iconColor = isMongo ? 'text-mongo' : 'text-postgres';
 
@@ -205,7 +214,23 @@ export default function DatabaseDetailPage() {
             <div className="flex flex-col gap-5">
               {/* Connection string card */}
               <div className="bg-[#111111] border border-border rounded-lg p-5">
-                <div className="text-sm font-medium mb-3">Primary connection string</div>
+                <div className="flex items-center justify-between mb-3">
+                  <div className="text-sm font-medium">Connection string</div>
+                  <div className="flex gap-1 rounded-md border border-border bg-[#0d0d0d] p-1 text-xs">
+                    <button
+                      onClick={() => setUrlFormat('sdk')}
+                      className={`rounded px-2.5 py-1 font-medium transition-colors ${urlFormat === 'sdk' ? 'bg-bg-card text-text-primary' : 'text-text-secondary hover:text-text-primary'}`}
+                    >
+                      SDK · cached
+                    </button>
+                    <button
+                      onClick={() => setUrlFormat('standard')}
+                      className={`rounded px-2.5 py-1 font-medium transition-colors ${urlFormat === 'standard' ? 'bg-bg-card text-text-primary' : 'text-text-secondary hover:text-text-primary'}`}
+                    >
+                      Standard
+                    </button>
+                  </div>
+                </div>
                 <div className="flex items-center gap-3 bg-[#0d0d0d] border border-border rounded-lg p-3">
                   <span className="flex-1 font-mono text-sm text-text-primary break-all">
                     {showPassword ? url : maskedUrl}
@@ -218,51 +243,97 @@ export default function DatabaseDetailPage() {
                   </button>
                   <CopyButton value={url} />
                 </div>
-                <div className="text-xs text-text-muted mt-2.5">Connected via port {db.port}</div>
+                <div className="text-xs text-text-muted mt-2.5">
+                  {urlFormat === 'sdk' ? (
+                    <>Use with <code className="font-mono text-text-secondary">@customdb/client</code> — automatic Redis caching, no separate config.</>
+                  ) : (
+                    <>Standard {isMongo ? 'MongoDB' : 'PostgreSQL'} URL — works with any driver, Compass, mongosh{isMongo ? '' : ', psql'}, etc.</>
+                  )}
+                </div>
               </div>
 
               {/* Code snippet card */}
-              <div className="bg-[#111111] border border-border rounded-lg overflow-hidden">
-                <div className="flex items-center justify-between px-4 pt-3 pb-0">
-                  <div className="flex gap-[18px]">
-                    <span className="text-sm font-medium text-text-primary border-b-2 border-accent pb-2.5">
-                      {isMongo ? 'Node.js' : 'psql'}
+              {urlFormat === 'sdk' ? (
+                <div className="bg-[#111111] border border-border rounded-lg overflow-hidden">
+                  <div className="flex items-center justify-between px-4 pt-3 pb-2.5">
+                    <span className="text-sm font-medium text-text-primary">
+                      Install {isMongo ? '@customdb/client + mongodb' : '@customdb/client + pg'}
                     </span>
-                    <span className="text-sm font-medium text-text-secondary pb-2.5 cursor-pointer">
-                      {isMongo ? 'Python' : 'Node.js'}
-                    </span>
-                    <span className="text-sm font-medium text-text-secondary pb-2.5 cursor-pointer">
-                      {isMongo ? 'Go' : 'Python'}
-                    </span>
+                    <CopyButton
+                      value={isMongo ? 'npm install @customdb/client mongodb' : 'npm install @customdb/client pg'}
+                      label="Copy"
+                    />
                   </div>
-                  <CopyButton value={isMongo
-                    ? `import { MongoClient } from 'mongodb';\n\nconst client = new MongoClient(process.env.DATABASE_URL);\nawait client.connect();\n\nconst db = client.db('${db.name}');\nconst docs = await db.collection('users').find().toArray();`
-                    : `psql "${url}"`
-                  } label="Copy" />
-                </div>
-                <div className="border-t border-border">
-                  <pre className="m-0 p-4 font-mono text-sm leading-[1.7] text-text-primary overflow-auto">
+                  <div className="border-t border-border bg-[#0d0d0d] px-4 py-3">
+                    <code className="font-mono text-sm text-text-primary">
+                      {isMongo ? 'npm install @customdb/client mongodb' : 'npm install @customdb/client pg'}
+                    </code>
+                  </div>
+                  <div className="flex items-center justify-between px-4 pt-3 pb-2.5 border-t border-border">
+                    <span className="text-sm font-medium text-text-primary">Use it</span>
+                    <CopyButton
+                      value={isMongo
+                        ? `const { CustomDBMongo } = require('@customdb/client');\n\nconst db = new CustomDBMongo(process.env.CUSTOMDB_URL);\n\n// Reads are cached automatically (~60s TTL)\nconst docs = await db.collection('users').find({});\n\n// Writes invalidate the cache automatically\nawait db.collection('users').insertOne({ name: 'Ada' });`
+                        : `const { CustomDBPostgres } = require('@customdb/client');\n\nconst pg = new CustomDBPostgres({\n  connectionString: process.env.CUSTOMDB_URL,\n});\n\n// SELECT results are cached automatically (~60s TTL)\nconst { rows } = await pg.query('SELECT * FROM users');\n\n// INSERT/UPDATE/DELETE invalidate the cache automatically\nawait pg.query('UPDATE users SET name = $1 WHERE id = $2', ['Ada', 1]);`
+                      }
+                      label="Copy"
+                    />
+                  </div>
+                  <pre className="m-0 p-4 font-mono text-sm leading-[1.7] text-text-primary overflow-auto border-t border-border">
                     {isMongo ? (
                       <>
-                        <span className="text-accent">import</span>{' { MongoClient } '}<span className="text-accent">from</span>{' '}<span className="text-success">{`'mongodb'`}</span>;{'\n\n'}
+                        <span className="text-accent">const</span>{' { CustomDBMongo } = '}<span className="text-postgres">require</span>{'('}<span className="text-success">'@customdb/client'</span>{');\n\n'}
+                        <span className="text-accent">const</span>{' db = '}<span className="text-accent">new</span>{' '}<span className="text-mongo">CustomDBMongo</span>{'(process.env.'}<span className="text-warning">CUSTOMDB_URL</span>{');\n\n'}
+                        <span className="text-text-secondary">{'// Reads are cached automatically (~60s TTL)'}</span>{'\n'}
+                        <span className="text-accent">const</span>{' docs = '}<span className="text-accent">await</span>{' db.'}<span className="text-postgres">collection</span>{'('}<span className="text-success">'users'</span>{').'}<span className="text-postgres">find</span>{'({});\n\n'}
+                        <span className="text-text-secondary">{'// Writes invalidate the cache automatically'}</span>{'\n'}
+                        <span className="text-accent">await</span>{' db.'}<span className="text-postgres">collection</span>{'('}<span className="text-success">'users'</span>{').'}<span className="text-postgres">insertOne</span>{'({ name: '}<span className="text-success">'Ada'</span>{' });'}
+                      </>
+                    ) : (
+                      <>
+                        <span className="text-accent">const</span>{' { CustomDBPostgres } = '}<span className="text-postgres">require</span>{'('}<span className="text-success">'@customdb/client'</span>{');\n\n'}
+                        <span className="text-accent">const</span>{' pg = '}<span className="text-accent">new</span>{' '}<span className="text-postgres">CustomDBPostgres</span>{'({\n  connectionString: process.env.'}<span className="text-warning">CUSTOMDB_URL</span>{',\n});\n\n'}
+                        <span className="text-text-secondary">{'// SELECT results are cached automatically (~60s TTL)'}</span>{'\n'}
+                        <span className="text-accent">const</span>{' { rows } = '}<span className="text-accent">await</span>{' pg.'}<span className="text-postgres">query</span>{'('}<span className="text-success">'SELECT * FROM users'</span>{');\n\n'}
+                        <span className="text-text-secondary">{'// INSERT/UPDATE/DELETE invalidate the cache automatically'}</span>{'\n'}
+                        <span className="text-accent">await</span>{' pg.'}<span className="text-postgres">query</span>{'('}<span className="text-success">{`'UPDATE users SET name = $1 WHERE id = $2'`}</span>{', ['}<span className="text-success">'Ada'</span>{', 1]);'}
+                      </>
+                    )}
+                  </pre>
+                </div>
+              ) : (
+                <div className="bg-[#111111] border border-border rounded-lg overflow-hidden">
+                  <div className="flex items-center justify-between px-4 pt-3 pb-2.5">
+                    <span className="text-sm font-medium text-text-primary">
+                      {isMongo ? 'Standard mongodb driver' : 'Standard pg driver / psql'}
+                    </span>
+                    <CopyButton value={isMongo
+                      ? `const { MongoClient } = require('mongodb');\n\nconst client = new MongoClient(process.env.DATABASE_URL);\nawait client.connect();\n\nconst db = client.db('${db.name}');\nconst docs = await db.collection('users').find().toArray();`
+                      : `psql "${url}"`
+                    } label="Copy" />
+                  </div>
+                  <pre className="m-0 p-4 font-mono text-sm leading-[1.7] text-text-primary overflow-auto border-t border-border">
+                    {isMongo ? (
+                      <>
+                        <span className="text-accent">const</span>{' { MongoClient } = '}<span className="text-postgres">require</span>{'('}<span className="text-success">'mongodb'</span>{');\n\n'}
                         <span className="text-accent">const</span>{' client = '}<span className="text-accent">new</span>{' '}<span className="text-mongo">MongoClient</span>{'(process.env.'}<span className="text-warning">DATABASE_URL</span>{');\n'}
                         <span className="text-accent">await</span>{' client.'}<span className="text-postgres">connect</span>{'();\n\n'}
                         <span className="text-accent">const</span>{' db = client.'}<span className="text-postgres">db</span>{'('}<span className="text-success">{`'${db.name}'`}</span>{');\n'}
-                        <span className="text-accent">const</span>{' docs = '}<span className="text-accent">await</span>{' db.'}<span className="text-postgres">collection</span>{'('}<span className="text-success">{`'users'`}</span>{').'}<span className="text-postgres">find</span>{'().'}<span className="text-postgres">toArray</span>{'();'}
+                        <span className="text-accent">const</span>{' docs = '}<span className="text-accent">await</span>{' db.'}<span className="text-postgres">collection</span>{'('}<span className="text-success">'users'</span>{').'}<span className="text-postgres">find</span>{'().'}<span className="text-postgres">toArray</span>{'();'}
                       </>
                     ) : (
                       <>
                         <span className="text-text-secondary"># connect with psql</span>{'\n'}
                         <span className="text-accent">psql</span>{' '}<span className="text-success">{`"${maskedUrl}"`}</span>{'\n\n'}
                         <span className="text-text-secondary"># or in your app</span>{'\n'}
-                        <span className="text-accent">const</span>{' { Pool } = require('}<span className="text-success">{`'pg'`}</span>{');\n'}
+                        <span className="text-accent">const</span>{' { Pool } = '}<span className="text-postgres">require</span>{'('}<span className="text-success">'pg'</span>{');\n'}
                         <span className="text-accent">const</span>{' pool = '}<span className="text-accent">new</span>{' '}<span className="text-postgres">Pool</span>{'({ connectionString: process.env.'}<span className="text-warning">DATABASE_URL</span>{' });\n'}
-                        <span className="text-accent">const</span>{' res = '}<span className="text-accent">await</span>{' pool.'}<span className="text-postgres">query</span>{'('}<span className="text-success">{`'SELECT * FROM users'`}</span>{');'}
+                        <span className="text-accent">const</span>{' res = '}<span className="text-accent">await</span>{' pool.'}<span className="text-postgres">query</span>{'('}<span className="text-success">'SELECT * FROM users'</span>{');'}
                       </>
                     )}
                   </pre>
                 </div>
-              </div>
+              )}
             </div>
 
             {/* Right column */}
