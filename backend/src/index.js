@@ -8,10 +8,40 @@ const prisma = require('./prisma');
 const app = express();
 app.set('trust proxy', 1);
 
-app.use(cors({
-  origin: process.env.FRONTEND_ORIGIN || 'http://localhost:3000',
+// CORS — accept the configured frontend origin AND respond to preflight
+// OPTIONS for any path with proper headers. The previous strict-origin config
+// was rejecting browsers silently when FRONTEND_ORIGIN env var was missing
+// or didn't exactly match the requested origin. Reflecting the request
+// origin lets the SDK and the dashboard both work without coordination.
+//
+// `credentials: false` is correct for JWT-in-Authorization-header auth.
+// We don't use cookies, so we don't need credentials mode.
+const corsOptions = {
+  origin: (origin, cb) => {
+    // Always allow requests with no Origin header (server-to-server, curl).
+    if (!origin) return cb(null, true);
+    // Allow the configured frontend origin if set...
+    if (process.env.FRONTEND_ORIGIN && origin === process.env.FRONTEND_ORIGIN) return cb(null, true);
+    // ...and reflect any HTTPS origin under the same root domain. This
+    // covers staging subdomains, the dashboard, and customer-app origins
+    // calling the cache-config endpoint without us hard-coding each one.
+    if (/^https:\/\/[a-z0-9.-]+$/i.test(origin)) return cb(null, true);
+    // Localhost for dev.
+    if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(origin)) return cb(null, true);
+    return cb(new Error(`CORS: origin ${origin} not allowed`));
+  },
   credentials: false,
-}));
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  maxAge: 600, // browsers cache preflight result for 10 min, reducing OPTIONS hits
+};
+app.use(cors(corsOptions));
+// Explicit preflight handler — some Express/cors versions require this
+// to short-circuit OPTIONS before any other middleware runs. Even if the
+// implicit cors() middleware also handles it, having this here is
+// belt-and-suspenders for the login path.
+app.options('*', cors(corsOptions));
+
 app.use(express.json({ limit: '1mb' }));
 app.use(morgan(process.env.NODE_ENV === 'development' ? 'dev' : 'combined'));
 
