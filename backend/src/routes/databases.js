@@ -736,7 +736,21 @@ router.get('/:id/import/:jobId/status', requireAuth, async (req, res) => {
 });
 
 // ──────────────────────────────────────────────────────────────────────────────
-// DELETE /api/databases/:id  — stop + remove container, drop data, delete row
+// DELETE /api/databases/:id  — stop + remove container, drop data, delete row.
+//
+// IMPORTANT: this responds to the client BEFORE the teardown finishes. A
+// multi-GB Mongo data dir can take 30+ seconds to fs.rm, and that walk used
+// to block the response, which had three nasty side effects:
+//   1. The dashboard's auto-refresh queries timed out, looked like 401,
+//      bounced the user to /login.
+//   2. fs.rm ate every libuv worker thread, queueing bcrypt.compare from
+//      the next login behind it — login itself then took forever to return.
+//   3. Disk I/O contention dragged the meta-DB Postgres down too.
+//
+// The fix here is two-fold: mark the row as deleted immediately (so it
+// disappears from the user's list), respond, THEN do the slow teardown.
+// We also bump UV_THREADPOOL_SIZE in docker-compose so even if a teardown
+// IS using fs threads, login's bcrypt has plenty of capacity left.
 // ──────────────────────────────────────────────────────────────────────────────
 router.delete('/:id', requireAuth, async (req, res, next) => {
   if (!validIdOr404(req, res)) return;
@@ -748,27 +762,33 @@ router.delete('/:id', requireAuth, async (req, res, next) => {
 
     const { containerName, dataDir } = resolveNames(db);
 
-    try { await stopAndRemoveContainer(containerName); }
-    catch (e) { console.error('[delete] container teardown:', e.message); }
-
-    try { await removeDataDir(dataDir); }
-    catch (e) { console.error('[delete] data dir cleanup:', e.message); }
-
-    try { await removeInitScript(containerName); }
-    catch (e) { console.error('[delete] init script cleanup:', e.message); }
-
-    if (db.routing === 'nginx') {
-      try { await removeStreamBlock(db.port); await reloadNginx(); }
-      catch (e) { console.error('[delete] nginx cleanup:', e.message); }
-    }
-
-    // Cascade removes credentials too.
+    // Cascade removes credentials too. Doing this FIRST means the row is
+    // gone from the user's POV before the slow disk work even starts.
     await prisma.database.delete({ where: { id: db.id } });
-
     cache.invalidate(`inspect:${containerName}`);
     cache.invalidate(`storage:${db.id}`);
 
     res.json({ ok: true, deleted: { id: db.id, name: db.dbName } });
+
+    // Now do the actual filesystem + container teardown in the background.
+    // setImmediate yields to the event loop so the response flushes first.
+    // Errors only get logged — the user has already moved on.
+    setImmediate(async () => {
+      try {
+        await stopAndRemoveContainer(containerName);
+      } catch (e) { console.error('[delete:bg] container teardown:', e.message); }
+      try {
+        await removeDataDir(dataDir);
+      } catch (e) { console.error('[delete:bg] data dir cleanup:', e.message); }
+      try {
+        await removeInitScript(containerName);
+      } catch (e) { console.error('[delete:bg] init script cleanup:', e.message); }
+      if (db.routing === 'nginx') {
+        try { await removeStreamBlock(db.port); await reloadNginx(); }
+        catch (e) { console.error('[delete:bg] nginx cleanup:', e.message); }
+      }
+      console.log(`[delete:bg] finished teardown of ${db.dbName} (${db.id})`);
+    });
   } catch (err) {
     next(err);
   }

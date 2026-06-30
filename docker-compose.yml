@@ -75,6 +75,11 @@ services:
       REDIS_URL: redis://default:${REDIS_PASSWORD}@customdb-redis:6379
       REDIS_PUBLIC_HOST: ${VPS_HOST}
       REDIS_PUBLIC_PORT: 6380
+      # libuv thread pool size. Node's default is 4 — too small when a
+      # background fs.rm (deleting a multi-GB data dir) can monopolize all
+      # of them, queueing bcrypt.compare from concurrent login attempts.
+      # 16 leaves plenty of headroom for auth even mid-cleanup.
+      UV_THREADPOOL_SIZE: 16
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       # Mount host /data so the path is identical inside the backend AND when
