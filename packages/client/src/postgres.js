@@ -56,7 +56,10 @@ class CustomDBPostgres {
 
   async connect() {
     if (this._connectPromise) return this._connectPromise;
-    this._connectPromise = this._cache.connect().then(() => this);
+    // Cache connection is best-effort — if cache-config or Redis is down the
+    // SDK still works, every query just goes straight to Postgres (the
+    // CacheLayer retries in the background with a cooldown).
+    this._connectPromise = this._cache.connect().catch(() => {}).then(() => this);
     return this._connectPromise;
   }
 
@@ -67,11 +70,13 @@ class CustomDBPostgres {
     const analysis = analyzeSql(sql);
 
     if (analysis.kind === 'select') {
-      // Cache key includes the version of every table the SELECT reads from.
-      // Bumping any of those tables invalidates this entry.
-      const tagVersions = await Promise.all(
-        analysis.tables.map((t) => this._cache.getTagVersion(`tbl:${t}`))
-      );
+      // Cache key includes the version of every table the SELECT reads from,
+      // PLUS the global __all__ tag — that's what unparseable writes and DDL
+      // bump, so "invalidate everything" actually reaches every cached read.
+      const tagVersions = await Promise.all([
+        this._cache.getTagVersion('__all__'),
+        ...analysis.tables.map((t) => this._cache.getTagVersion(`tbl:${t}`)),
+      ]);
       const versionSalt = tagVersions.join('|');
       const key = `sql:v${versionSalt}:${hashQuery({ sql, params: params || [] })}`;
       return this._cache.getOrSet(key, undefined, () => this._runRaw(sql, params));

@@ -13,10 +13,21 @@ services:
       FRONTEND_ORIGIN: http://localhost:3030
       VPS_HOST: localhost
       NGINX_STREAM_DIR: /etc/nginx/stream.d
+      # DATA_ROOT must be a path that is IDENTICAL on the host and inside this
+      # container: the backend both writes files there itself (fs) and tells
+      # the Docker daemon to bind-mount subpaths of it into user DB containers
+      # — and the daemon resolves those paths on the HOST. `${PWD}/data`
+      # satisfies that via the identity mount below. (Run compose from the
+      # repo root; on Windows use WSL so $PWD exists.)
+      DATA_ROOT: ${PWD}/data
     ports:
       - "4000:4000"
     volumes:
+      # Neutralize the base file's `/data:/data` (macOS hosts have no /data);
+      # same container target overrides it.
       - ./data:/data
+      # The real data root — identical path inside and out.
+      - ${PWD}/data:${PWD}/data
       - ./nginx/stream.d:/etc/nginx/stream.d
       - /var/run/docker.sock:/var/run/docker.sock
     networks:

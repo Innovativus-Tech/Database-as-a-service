@@ -97,10 +97,15 @@ export const api = {
     if (schema) params.set('schema', schema);
     return request(`/api/databases/${id}/collections/${encodeURIComponent(name)}?${params}`);
   },
-  updateDocument: (id, name, docId, payload, schema) =>
-    request(`/api/databases/${id}/collections/${encodeURIComponent(name)}/${encodeURIComponent(docId)}`, {
-      method: 'PUT', body: schema ? { ...payload, schema } : payload,
-    }),
+  // schema travels in the query string, NOT the body — for Mongo the body IS
+  // the document, and merging `schema` into it wrote a phantom `schema` field
+  // into customer documents on every save.
+  updateDocument: (id, name, docId, payload, schema) => {
+    const qs = schema ? `?schema=${encodeURIComponent(schema)}` : '';
+    return request(`/api/databases/${id}/collections/${encodeURIComponent(name)}/${encodeURIComponent(docId)}${qs}`, {
+      method: 'PUT', body: payload,
+    });
+  },
   deleteDocument: (id, name, docId, schema) => {
     const qs = schema ? `?schema=${encodeURIComponent(schema)}` : '';
     return request(`/api/databases/${id}/collections/${encodeURIComponent(name)}/${encodeURIComponent(docId)}${qs}`, { method: 'DELETE' });

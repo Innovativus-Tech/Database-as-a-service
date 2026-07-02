@@ -148,9 +148,12 @@ function toMongoId(id) {
 async function updateMongoDocument({ connectionUrl, dbName, collection, id, doc }) {
   return withMongo(connectionUrl, async (client) => {
     const { _id, ...rest } = doc || {};
-    const result = await client.db(dbName).collection(collection).updateOne(
+    // replaceOne, not updateOne+$set: the document editor sends the WHOLE
+    // document, so a field the user deleted in the editor must actually be
+    // removed — $set would silently keep it.
+    const result = await client.db(dbName).collection(collection).replaceOne(
       { _id: toMongoId(id) },
-      { $set: rest }
+      rest
     );
     if (result.matchedCount === 0) throw Object.assign(new Error('Document not found'), { status: 404 });
     return { ok: true };

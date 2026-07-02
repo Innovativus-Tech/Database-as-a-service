@@ -8,39 +8,54 @@ const prisma = require('./prisma');
 const app = express();
 app.set('trust proxy', 1);
 
-// CORS — accept the configured frontend origin AND respond to preflight
-// OPTIONS for any path with proper headers. The previous strict-origin config
-// was rejecting browsers silently when FRONTEND_ORIGIN env var was missing
-// or didn't exactly match the requested origin. Reflecting the request
-// origin lets the SDK and the dashboard both work without coordination.
+// CORS — two policies:
+//
+// 1. Dashboard/API routes (/api/auth, /api/databases): restricted to the
+//    configured FRONTEND_ORIGIN, any https subdomain of its registrable
+//    domain (staging, previews), and localhost for dev. The old config
+//    reflected EVERY https origin here, which let any website script calls
+//    against the dashboard API.
+// 2. /api/cache-config: open to any origin — it authenticates with per-DB
+//    Basic credentials (no cookies, no ambient auth), and customer apps
+//    live on domains we can't enumerate.
 //
 // `credentials: false` is correct for JWT-in-Authorization-header auth.
-// We don't use cookies, so we don't need credentials mode.
-const corsOptions = {
-  origin: (origin, cb) => {
-    // Always allow requests with no Origin header (server-to-server, curl).
-    if (!origin) return cb(null, true);
-    // Allow the configured frontend origin if set...
-    if (process.env.FRONTEND_ORIGIN && origin === process.env.FRONTEND_ORIGIN) return cb(null, true);
-    // ...and reflect any HTTPS origin under the same root domain. This
-    // covers staging subdomains, the dashboard, and customer-app origins
-    // calling the cache-config endpoint without us hard-coding each one.
-    if (/^https:\/\/[a-z0-9.-]+$/i.test(origin)) return cb(null, true);
-    // Localhost for dev.
-    if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(origin)) return cb(null, true);
-    return cb(new Error(`CORS: origin ${origin} not allowed`));
-  },
+// Disallowed origins get cb(null, false) — request proceeds without CORS
+// headers (browser blocks the read) instead of a confusing 500.
+function registrableDomain(hostname) {
+  const parts = hostname.split('.').filter(Boolean);
+  return parts.length <= 2 ? hostname : parts.slice(-2).join('.');
+}
+const FRONTEND_ORIGIN = (process.env.FRONTEND_ORIGIN || '').replace(/\/+$/, '');
+let allowedRootDomain = null;
+try {
+  if (FRONTEND_ORIGIN) allowedRootDomain = registrableDomain(new URL(FRONTEND_ORIGIN).hostname);
+} catch { /* malformed FRONTEND_ORIGIN — fall through to localhost-only */ }
+
+const sharedCors = {
   credentials: false,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
   maxAge: 600, // browsers cache preflight result for 10 min, reducing OPTIONS hits
 };
-app.use(cors(corsOptions));
-// Explicit preflight handler — some Express/cors versions require this
-// to short-circuit OPTIONS before any other middleware runs. Even if the
-// implicit cors() middleware also handles it, having this here is
-// belt-and-suspenders for the login path.
-app.options('*', cors(corsOptions));
+const dashboardCors = cors({
+  ...sharedCors,
+  origin: (origin, cb) => {
+    // No Origin header = server-to-server / curl — not a browser, allow.
+    if (!origin) return cb(null, true);
+    if (FRONTEND_ORIGIN && origin === FRONTEND_ORIGIN) return cb(null, true);
+    try {
+      const { protocol, hostname } = new URL(origin);
+      if (/^https?:$/.test(protocol) && /^(localhost|127\.0\.0\.1)$/.test(hostname)) return cb(null, true);
+      if (protocol === 'https:' && allowedRootDomain &&
+          (hostname === allowedRootDomain || hostname.endsWith(`.${allowedRootDomain}`))) {
+        return cb(null, true);
+      }
+    } catch { /* unparseable origin — disallow */ }
+    return cb(null, false);
+  },
+});
+const openCors = cors({ ...sharedCors, origin: true });
 
 // 17mb: MongoDB documents can be up to 16 MB, and the document editor PUTs
 // the whole document as a JSON body. 1 MB silently rejected legitimate edits.
@@ -80,14 +95,38 @@ app.get('/health', async (req, res) => {
   }
 });
 
-app.use('/api/auth', require('./routes/auth').router);
-app.use('/api/databases', require('./routes/databases'));
-app.use('/api', require('./routes/cacheConfig'));
+app.use('/api/auth', dashboardCors, require('./routes/auth').router);
+app.use('/api/databases', dashboardCors, require('./routes/databases'));
+app.use('/api', openCors, require('./routes/cacheConfig'));
 
 app.use((err, req, res, _next) => {
   console.error(err);
   res.status(err.status || 500).json({ error: err.message || 'Internal server error' });
 });
+
+// Redis ACL users are created with ACL SETUSER and are NOT persisted by
+// Redis across restarts — after a Redis restart every per-DB cache user is
+// gone, and customers using the raw redis:// URL get NOAUTH errors until
+// something re-provisions them. Re-assert all ACLs on boot and every 10
+// minutes (SETUSER is idempotent and one round-trip per DB — cheap).
+async function reprovisionAllRedisAcls() {
+  if (!process.env.REDIS_URL) return 0; // no platform Redis configured (bare local dev)
+  const { ensureAclProvisioned } = require('./services/redisCreds');
+  const { cache } = require('./services/cache');
+  const dbs = await prisma.database.findMany({
+    where: { status: 'active' },
+    select: { id: true },
+  });
+  let failed = 0;
+  for (const db of dbs) {
+    // Drop the 5-min memo first so the sweep always issues a real SETUSER —
+    // the memo exists to absorb request bursts, not to skip the healer.
+    cache.invalidate(`acl-provisioned:${db.id}`);
+    try { await ensureAclProvisioned(db.id); } catch { failed++; }
+  }
+  if (failed > 0) console.warn(`[redis-acl] re-provision: ${failed}/${dbs.length} failed (Redis down?)`);
+  return dbs.length;
+}
 
 async function bootstrap() {
   const { ensureNetwork } = require('./services/dockerNetwork');
@@ -131,6 +170,15 @@ async function bootstrap() {
       }
       console.log('[bootstrap:bg] container reconciliation complete');
     });
+
+    // Redis ACL healer — once now (covers "Redis restarted while backend was
+    // down"), then every 10 minutes (covers "Redis restarted while we're up").
+    reprovisionAllRedisAcls()
+      .then((n) => console.log(`[redis-acl] provisioned ${n} cache users`))
+      .catch((err) => console.warn('[redis-acl] initial sweep failed:', err.message));
+    setInterval(() => {
+      reprovisionAllRedisAcls().catch(() => {});
+    }, 10 * 60 * 1000).unref();
   } catch (err) {
     console.warn('[bootstrap] non-fatal init warning:', err.message);
   }

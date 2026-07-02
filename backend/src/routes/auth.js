@@ -98,6 +98,12 @@ function getFrontendOrigin(req) {
 
 router.post('/signup', async (req, res, next) => {
   try {
+    // Signups mint sessions AND (later) real Docker containers — keep bots
+    // from bulk-registering. Window matches the login limiter's shape.
+    if (!rateLimit(`signup:${clientIp(req)}`, 10, 60 * 60 * 1000)) {
+      return res.status(429).json({ error: 'Too many signups from this address. Try again later.' });
+    }
+
     const { error, email, password } = validateCredentials(req.body);
     if (error) return res.status(400).json({ error });
 

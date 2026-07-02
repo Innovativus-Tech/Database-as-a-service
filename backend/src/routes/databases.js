@@ -638,10 +638,14 @@ router.put('/:id/collections/:name/:docId', requireAuth, async (req, res, next) 
     const loaded = await loadDatabaseWithUrl(req.user.id, req.params.id);
     if (!loaded) return res.status(404).json({ error: 'Database not found or not active' });
     const { db, internalUrl } = loaded;
-    const schema = resolveSchema(req, db);
     const collection = req.params.name;
 
     if (db.type === 'nosql') {
+      // For Mongo the request body IS the document, so the target schema may
+      // only come from the query string — reading body.schema here would
+      // misroute the write for any document that legitimately contains a
+      // `schema` field (and the old body-merge wrote phantom fields).
+      const schema = (typeof req.query.schema === 'string' && req.query.schema) || db.dbName;
       if (typeof req.body !== 'object' || req.body === null) {
         return res.status(400).json({ error: 'Body must be a JSON object' });
       }
@@ -649,6 +653,7 @@ router.put('/:id/collections/:name/:docId', requireAuth, async (req, res, next) 
         connectionUrl: internalUrl, dbName: schema, collection, id: req.params.docId, doc: req.body,
       });
     } else {
+      const schema = resolveSchema(req, db);
       const values = req.body?.values;
       if (!values || typeof values !== 'object') {
         return res.status(400).json({ error: 'Body must be { values: { col: val, ... } }' });

@@ -192,6 +192,21 @@ async function importMongodumpZip({ containerName, mongoUser, mongoPassword, mon
   const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'cdb-mongodump-'));
   try {
     const zip = new AdmZip(filePath);
+
+    // Zip-bomb guard: a 200 MB upload can decompress to hundreds of GB and
+    // fill the host disk. Sum the declared uncompressed sizes before
+    // extracting anything and refuse anything past the cap.
+    const MAX_UNCOMPRESSED_BYTES = 4 * 1024 * 1024 * 1024; // 4 GB
+    const MAX_ENTRIES = 10_000;
+    const entries = zip.getEntries();
+    if (entries.length > MAX_ENTRIES) {
+      throw Object.assign(new Error(`Archive has too many entries (${entries.length} > ${MAX_ENTRIES})`), { status: 400 });
+    }
+    const uncompressed = entries.reduce((sum, e) => sum + (e.header.size || 0), 0);
+    if (uncompressed > MAX_UNCOMPRESSED_BYTES) {
+      throw Object.assign(new Error('Archive decompresses to more than 4 GB — too large to import via upload'), { status: 400 });
+    }
+
     zip.extractAllTo(tmpDir, /*overwrite*/ true);
 
     // mongorestore expects the dump root. Some zips wrap it in a "dump/" dir, some don't.

@@ -17,6 +17,21 @@ const { MongoClient } = require('mongodb');
 const { parse } = require('./connectionString');
 const { CacheLayer, hashQuery } = require('./cache');
 
+// EJSON preserves ObjectId / Date / Binary etc. through the cache's string
+// round-trip — with plain JSON a cache HIT would hand back `_id` as a hex
+// string while a MISS returns a real ObjectId. Available in driver >= 5 via
+// the re-exported BSON namespace; fall back to plain JSON if absent.
+let ejsonSerializer = null;
+try {
+  const { BSON } = require('mongodb');
+  if (BSON && BSON.EJSON) {
+    ejsonSerializer = {
+      stringify: (v) => BSON.EJSON.stringify(v, { relaxed: true }),
+      parse: (s) => BSON.EJSON.parse(s, { relaxed: true }),
+    };
+  }
+} catch { /* keep JSON fallback */ }
+
 class CustomDBMongo {
   constructor(connectionString, options = {}) {
     const parsed = parse(connectionString);
@@ -31,6 +46,7 @@ class CustomDBMongo {
       dbType: 'nosql',
       defaultTtl: options.defaultTtl,
       debug: options.debug,
+      serializer: ejsonSerializer || undefined,
     });
     this._mongo = new MongoClient(parsed.driverUrl, options.mongoOptions || {});
     this._connectPromise = null;
@@ -38,9 +54,13 @@ class CustomDBMongo {
 
   async connect() {
     if (this._connectPromise) return this._connectPromise;
+    // The cache connection is best-effort: if cache-config or Redis is down,
+    // the SDK still works — every read just goes straight to Mongo (the
+    // CacheLayer retries its connection in the background with a cooldown).
+    // Only a Mongo connection failure is fatal here.
     this._connectPromise = Promise.all([
       this._mongo.connect(),
-      this._cache.connect(),
+      this._cache.connect().catch(() => {}),
     ]).then(() => this);
     return this._connectPromise;
   }

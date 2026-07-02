@@ -8,8 +8,13 @@
 const crypto = require('crypto');
 const Redis = require('ioredis');
 
+// After a failed connect, don't hammer the config endpoint / Redis on every
+// query — wait this long before the next attempt. Queries in the cooldown
+// window go straight to the database.
+const RECONNECT_COOLDOWN_MS = 30_000;
+
 class CacheLayer {
-  constructor({ cacheConfigUrl, username, password, dbId: knownDbId, dbType, defaultTtl, debug }) {
+  constructor({ cacheConfigUrl, username, password, dbId: knownDbId, dbType, defaultTtl, debug, serializer }) {
     this.cacheConfigUrl = cacheConfigUrl;
     this.username = username;
     this.password = password;
@@ -17,10 +22,14 @@ class CacheLayer {
     this.dbType = dbType;
     this.defaultTtl = defaultTtl ?? null;
     this.debug = !!debug;
+    // Optional { stringify, parse } pair — the Mongo client passes EJSON so
+    // ObjectId/Date survive the cache round-trip. Defaults to plain JSON.
+    this._serializer = serializer || JSON;
 
     this._redis = null;
     this._config = null;
     this._connectPromise = null;
+    this._lastConnectFailAt = 0;
   }
 
   // Fetches /api/cache-config with HTTP Basic auth, opens the Redis
@@ -30,7 +39,7 @@ class CacheLayer {
     this._connectPromise = (async () => {
       const cfg = await this._fetchConfig();
       this._config = cfg;
-      this._redis = new Redis({
+      const redis = new Redis({
         host: cfg.host,
         port: cfg.port,
         username: cfg.username,
@@ -48,21 +57,26 @@ class CacheLayer {
         enableReadyCheck: false,
         lazyConnect: false,
       });
-      // Wait for the connection to actually open before returning — keeps
-      // the very first cache call snappy and avoids buffered-command lag.
-      await new Promise((resolve, reject) => {
-        const onReady = () => { cleanup(); resolve(); };
-        const onError = (e) => { cleanup(); reject(e); };
-        const cleanup = () => {
-          this._redis.removeListener('connect', onReady);
-          this._redis.removeListener('error', onError);
-        };
-        this._redis.once('connect', onReady);
-        this._redis.once('error', onError);
-      });
-      this._redis.on('error', (err) => {
+      // Persistent error handler goes on BEFORE anything can fail — ioredis
+      // is an EventEmitter, and an 'error' event with no listener crashes
+      // the whole process (including background reconnect failures).
+      redis.on('error', (err) => {
         if (this.debug) console.warn('[customdb] redis error (non-fatal):', err.code || err.message);
       });
+      // Wait for the connection to actually open before returning — keeps
+      // the very first cache call snappy and avoids buffered-command lag.
+      try {
+        await new Promise((resolve, reject) => {
+          redis.once('connect', resolve);
+          redis.once('error', reject);
+        });
+      } catch (err) {
+        // Kill the failed instance so it doesn't keep retrying forever in
+        // the background; _ensureConnected() will build a fresh one later.
+        try { redis.disconnect(); } catch {}
+        throw err;
+      }
+      this._redis = redis;
     })();
     return this._connectPromise;
   }
@@ -81,11 +95,30 @@ class CacheLayer {
     return res.json();
   }
 
+  // Connect, but treat failure as "cache unavailable" instead of an error.
+  // A dead Redis or unreachable cache-config endpoint must never take the
+  // customer's database access down with it — reads/writes fall through to
+  // the real database and we retry the cache connection after a cooldown.
+  async _ensureConnected() {
+    if (this._redis && this._config) return true;
+    if (Date.now() - this._lastConnectFailAt < RECONNECT_COOLDOWN_MS) return false;
+    try {
+      await this.connect();
+      return true;
+    } catch (err) {
+      this._lastConnectFailAt = Date.now();
+      this._connectPromise = null; // allow a fresh attempt after the cooldown
+      if (this._redis) { try { this._redis.disconnect(); } catch {} this._redis = null; }
+      if (this.debug) console.warn('[customdb] cache unavailable, queries go direct to DB:', err.message);
+      return false;
+    }
+  }
+
   // Try Redis first; on miss or any error, call loader() and cache the result.
   // ttlSeconds: how long the cache entry lives. null/undefined = use server's
   // suggested default.
   async getOrSet(rawKey, ttlSeconds, loader) {
-    await this.connect();
+    if (!(await this._ensureConnected())) return loader();
     const key = this._namespacedKey(rawKey);
     const ttl = ttlSeconds ?? this._config?.defaultTtlSeconds ?? 60;
 
@@ -93,7 +126,7 @@ class CacheLayer {
       const hit = await this._redis.get(key);
       if (hit !== null) {
         if (this.debug) console.log(`[customdb] cache HIT ${key}`);
-        return JSON.parse(hit);
+        return this._serializer.parse(hit);
       }
     } catch (err) {
       // Redis read failed — degrade to direct DB call. Don't throw.
@@ -104,7 +137,7 @@ class CacheLayer {
     const fresh = await loader();
 
     try {
-      await this._redis.set(key, JSON.stringify(fresh), 'EX', ttl);
+      await this._redis.set(key, this._serializer.stringify(fresh), 'EX', ttl);
     } catch (err) {
       // Redis write failed — return fresh data without caching. Don't throw.
       if (this.debug) console.warn('[customdb] redis write error (non-fatal):', err.message);
@@ -127,7 +160,7 @@ class CacheLayer {
   // user is denied that command by ACL), so we keep a tag→version counter:
   // bumping the counter makes any cached entry for that tag stale immediately.
   async bumpTag(tag) {
-    if (!this._redis) return;
+    if (!(await this._ensureConnected())) return;
     try {
       await this._redis.incr(this._namespacedKey(`tag:${tag}`));
     } catch (err) {
@@ -139,7 +172,7 @@ class CacheLayer {
   // bumping the tag invalidates all keys derived from that tag in O(1) on
   // the write side. Old keys naturally expire via TTL.
   async getTagVersion(tag) {
-    if (!this._redis) return '0';
+    if (!(await this._ensureConnected())) return '0';
     try {
       const v = await this._redis.get(this._namespacedKey(`tag:${tag}`));
       return v || '0';
