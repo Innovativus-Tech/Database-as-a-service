@@ -19,64 +19,9 @@ const express = require('express');
 const crypto = require('crypto');
 const prisma = require('../prisma');
 const { decrypt } = require('../services/crypto');
-const { redis } = require('../services/redisClient');
-const { cache } = require('../services/cache');
+const { deriveRedisPassword, deriveRedisUsername, deriveKeyPrefix, ensureAclProvisioned } = require('../services/redisCreds');
 
 const router = express.Router();
-
-const REDIS_USER_PREFIX = 'rdb_';
-// Per-DB Redis ACL provisioning is deterministic and idempotent — once
-// done, it doesn't need to run again for the lifetime of the database.
-// Cache "provisioned" status in-memory so customer SDK calls (which can
-// happen on every cold-start of their app) don't run ACL SETUSER every
-// time. 5 minutes is long enough to absorb bursts; short enough that the
-// state self-heals after a Redis restart wipes ACL.
-const ACL_PROVISION_TTL_MS = 5 * 60_000;
-
-// HMAC-based deterministic password so we never need to store Redis creds.
-function deriveRedisPassword(dbId) {
-  return crypto
-    .createHmac('sha256', process.env.JWT_SECRET)
-    .update('redis:' + dbId)
-    .digest('hex')
-    .slice(0, 32);
-}
-
-function deriveRedisUsername(dbId) {
-  // Redis usernames must match [A-Za-z0-9_] — strip dashes from UUID.
-  return REDIS_USER_PREFIX + dbId.replace(/-/g, '').slice(0, 16);
-}
-
-function deriveKeyPrefix(dbId) {
-  return `cdb:${dbId}:`;
-}
-
-// Idempotent: SETUSER overwrites existing config, so calling it on every
-// request is safe and ensures the user always has the right ACL.
-async function ensureRedisUserExists({ username, password, keyPrefix }) {
-  // ACL command syntax: SETUSER <user> on >password ~keyPattern +@cats -cmds
-  // - `on` = enable user
-  // - `>password` = set the password
-  // - `~cdb:dbId:*` = only allow access to keys matching this pattern
-  // - `+@read +@write +@string +@hash ...` = standard data-plane commands
-  // - `-FLUSHDB -FLUSHALL -KEYS -CONFIG ...` = explicit denylist of dangerous
-  //   commands. These are technically inside @write/@keyspace categories, so
-  //   without explicit denial a customer could FLUSHDB and wipe their own
-  //   cache (annoying) or KEYS the entire keyspace and DoS the server.
-  //   Key-pattern ACL doesn't block these because they don't take a key arg.
-  await redis().call('ACL', 'SETUSER', username, 'on',
-    `>${password}`,
-    `~${keyPrefix}*`,
-    '+@read', '+@write',
-    '+@string', '+@hash', '+@set', '+@sortedset', '+@list',
-    '+@hyperloglog', '+@geo', '+@stream', '+@bitmap',
-    '+@scripting', '+@connection', '+@transaction',
-    '-FLUSHDB', '-FLUSHALL', '-KEYS', '-SCAN',
-    '-CONFIG', '-DEBUG', '-SHUTDOWN', '-MONITOR',
-    '-CLIENT', '-CLUSTER', '-REPLICAOF', '-SLAVEOF',
-    '-SAVE', '-BGSAVE', '-BGREWRITEAOF', '-LASTSAVE'
-  );
-}
 
 router.get('/cache-config', async (req, res) => {
   // Parse HTTP Basic auth header
@@ -128,23 +73,13 @@ router.get('/cache-config', async (req, res) => {
     return res.status(403).json({ error: 'Database is not active' });
   }
 
-  // Derive + ensure the per-DB Redis user
+  // Derive + ensure the per-DB Redis user (throttled + idempotent — see
+  // redisCreds.ensureAclProvisioned).
   const redisUsername = deriveRedisUsername(db.id);
   const redisPassword = deriveRedisPassword(db.id);
   const keyPrefix = deriveKeyPrefix(db.id);
-
-  // Run ACL provisioning at most once every ACL_PROVISION_TTL_MS per DB.
-  // Burst of N customer SDK calls collapses to one ACL SETUSER round-trip
-  // (via getOrLoad's in-flight dedupe + TTL).
   try {
-    await cache.getOrLoad(
-      `acl-provisioned:${db.id}`,
-      ACL_PROVISION_TTL_MS,
-      async () => {
-        await ensureRedisUserExists({ username: redisUsername, password: redisPassword, keyPrefix });
-        return true;
-      }
-    );
+    await ensureAclProvisioned(db.id);
   } catch (err) {
     console.error('[cache-config] failed to provision Redis ACL user:', err.message);
     return res.status(503).json({ error: 'Cache service temporarily unavailable' });

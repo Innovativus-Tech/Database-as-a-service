@@ -44,8 +44,12 @@ export default function DatabaseDetailPage() {
   const [importBusy, setImportBusy] = useState(false);
   const [importResult, setImportResult] = useState(null);
   const [importError, setImportError] = useState(null);
+  const [importProgress, setImportProgress] = useState(null); // { processed, total }
   const fileInputRef = useRef(null);
   const targetInputRef = useRef(null);
+  const pollRef = useRef(null);
+
+  useEffect(() => () => { if (pollRef.current) clearInterval(pollRef.current); }, []);
 
   const [deleteBusy, setDeleteBusy] = useState(false);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
@@ -88,18 +92,49 @@ export default function DatabaseDetailPage() {
     e.preventDefault();
     setImportError(null);
     setImportResult(null);
+    setImportProgress(null);
     const file = fileInputRef.current?.files?.[0];
     if (!file) { setImportError('Choose a file first'); return; }
     setImportBusy(true);
     try {
       const target = targetInputRef.current?.value?.trim() || undefined;
-      const res = await api.importFile(id, file, target);
-      setImportResult(res);
-      fileInputRef.current.value = '';
-      refreshStats();
+      // The import API is job-based: the upload returns { jobId } immediately
+      // and the actual insert runs server-side — poll for real progress.
+      const { jobId } = await api.importFile(id, file, target);
+      let consecutiveFailures = 0;
+      pollRef.current = setInterval(async () => {
+        try {
+          const status = await api.getImportJobStatus(id, jobId);
+          consecutiveFailures = 0;
+          setImportProgress({ processed: status.processed, total: status.total });
+          if (status.status === 'done') {
+            clearInterval(pollRef.current);
+            setImportResult(status.result);
+            setImportBusy(false);
+            setImportProgress(null);
+            if (fileInputRef.current) fileInputRef.current.value = '';
+            toast.success('Import complete');
+            refreshStats();
+          } else if (status.status === 'error') {
+            clearInterval(pollRef.current);
+            setImportError(status.error);
+            setImportBusy(false);
+            setImportProgress(null);
+          }
+        } catch (err) {
+          consecutiveFailures += 1;
+          if (err?.status === 401 || err?.status === 404 || consecutiveFailures >= 10) {
+            clearInterval(pollRef.current);
+            setImportError(err?.status === 404
+              ? 'Lost track of the import job (server may have restarted). Check Browse Data to see if it landed.'
+              : 'Can’t reach the server to check progress — the import may still be running.');
+            setImportBusy(false);
+            setImportProgress(null);
+          }
+        }
+      }, 1000);
     } catch (err) {
       setImportError(err.message);
-    } finally {
       setImportBusy(false);
     }
   }
@@ -251,6 +286,32 @@ export default function DatabaseDetailPage() {
                   )}
                 </div>
               </div>
+
+              {/* Redis cache link card — the second half of the connection
+                  pipeline: same creds pattern, scoped to this DB's key prefix. */}
+              {detail.redisCache && (
+                <div className="bg-[#111111] border border-border rounded-lg p-5">
+                  <div className="flex items-center justify-between mb-3">
+                    <div className="text-sm font-medium">Redis cache</div>
+                    <span className="rounded bg-bg-inset px-2 py-0.5 font-mono text-xs text-text-secondary">
+                      keys: {detail.redisCache.keyPrefix}*
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-3 bg-[#0d0d0d] border border-border rounded-lg p-3">
+                    <span className="flex-1 font-mono text-sm text-text-primary break-all">
+                      {showPassword
+                        ? detail.redisCache.url
+                        : detail.redisCache.url.replace(/:[^:@/]+@/, ':••••••@')}
+                    </span>
+                    <CopyButton value={detail.redisCache.url} />
+                  </div>
+                  <div className="text-xs text-text-muted mt-2.5">
+                    Dedicated cache user for this database — access is limited to keys under{' '}
+                    <code className="font-mono text-text-secondary">{detail.redisCache.keyPrefix}</code>.
+                    The SDK uses it automatically; paste into <code className="font-mono text-text-secondary">redis-cli -u</code> or ioredis for manual use.
+                  </div>
+                </div>
+              )}
 
               {/* Code snippet card */}
               {urlFormat === 'sdk' ? (
@@ -428,7 +489,7 @@ export default function DatabaseDetailPage() {
                       />
                     </label>
                   </div>
-                  <div className="text-xs text-text-muted mt-2">Max 500MB</div>
+                  <div className="text-xs text-text-muted mt-2">Max 200MB</div>
                 </div>
                 <input
                   ref={targetInputRef}
@@ -436,6 +497,16 @@ export default function DatabaseDetailPage() {
                   placeholder="Target collection/table (optional, defaults to filename)"
                   className="block w-full rounded-md border border-border bg-bg-inset px-3 py-2 text-sm font-mono text-text-primary placeholder:text-text-muted focus:border-accent focus:outline-none"
                 />
+                {importBusy && (
+                  <div className="rounded-md border border-border bg-bg-inset p-3 text-sm text-text-secondary">
+                    Importing…{' '}
+                    {importProgress?.total
+                      ? `${(importProgress.processed || 0).toLocaleString()} / ${importProgress.total.toLocaleString()} rows`
+                      : importProgress?.processed
+                        ? `${importProgress.processed.toLocaleString()} rows so far`
+                        : 'starting'}
+                  </div>
+                )}
                 {importError && <p className="text-sm text-danger">{importError}</p>}
                 {importResult && (
                   <div className="rounded-md bg-success/10 border border-success/20 p-3 text-sm text-text-primary">

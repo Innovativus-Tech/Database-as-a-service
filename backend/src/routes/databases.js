@@ -23,6 +23,7 @@ const {
 const { runImport } = require('../services/importRunner');
 const { cache } = require('../services/cache');
 const { createJob: createImportJob, getJob: getImportJob, updateJob: updateImportJob, scheduleCleanup: scheduleImportJobCleanup } = require('../services/importJobs');
+const { publicRedisUrl, deriveKeyPrefix, ensureAclProvisioned } = require('../services/redisCreds');
 const { FREE_DB_LIMIT } = require('./auth');
 const { addStreamBlock, removeStreamBlock, reloadNginx } = require('../services/nginxManager');
 const {
@@ -265,10 +266,28 @@ router.get('/:id', requireAuth, async (req, res, next) => {
       tls: !!db.tlsEnabled,
     });
 
+    // Companion Redis cache link (the second half of the connection
+    // "pipeline"). Provision the ACL user now so the URL works immediately
+    // if pasted into redis-cli / ioredis — the SDK would otherwise only
+    // provision it on its first /api/cache-config call. Best-effort: if
+    // Redis is down, the DB details still load, just without the cache URL.
+    let redisCache = null;
+    try {
+      await ensureAclProvisioned(db.id);
+      redisCache = {
+        url: publicRedisUrl(db.id, db.host),
+        keyPrefix: deriveKeyPrefix(db.id),
+        defaultTtlSeconds: 60,
+      };
+    } catch (err) {
+      console.warn('[databases/:id] redis cache link unavailable:', err.message);
+    }
+
     res.json({
       database: publicShape(db),
       credentials: { username: cred.username, password },
       connectionUrl,
+      redisCache,
     });
   } catch (err) {
     next(err);
