@@ -20,7 +20,7 @@ const {
   removeInitScript,
   deriveNames,
 } = require('../services/provisioning');
-const { dispatchImport } = require('../services/dataImport');
+const { runImport } = require('../services/importRunner');
 const { cache } = require('../services/cache');
 const { createJob: createImportJob, getJob: getImportJob, updateJob: updateImportJob, scheduleCleanup: scheduleImportJobCleanup } = require('../services/importJobs');
 const { FREE_DB_LIMIT } = require('./auth');
@@ -55,6 +55,20 @@ const upload = multer({
   }),
   limits: { fileSize: 200 * 1024 * 1024 }, // 200 MB
 });
+
+// Multer errors (oversized file, wrong field name) should read as client
+// errors, not opaque 500s from the generic handler.
+function uploadSingleFile(req, res, next) {
+  upload.single('file')(req, res, (err) => {
+    if (err) {
+      if (err.code === 'LIMIT_FILE_SIZE') {
+        return res.status(413).json({ error: 'File too large — imports are limited to 200 MB' });
+      }
+      return res.status(400).json({ error: err.message || 'Upload failed' });
+    }
+    next();
+  });
+}
 
 const router = express.Router();
 
@@ -646,7 +660,7 @@ router.delete('/:id/collections/:name/:docId', requireAuth, async (req, res, nex
 // Starts the import in the background and returns a jobId immediately —
 // the dashboard polls /:id/import/:jobId/status for real progress instead of
 // blocking on one long request (imports of large files can take minutes).
-router.post('/:id/import', requireAuth, upload.single('file'), async (req, res, next) => {
+router.post('/:id/import', requireAuth, uploadSingleFile, async (req, res, next) => {
   if (!validIdOr404(req, res)) {
     if (req.file) fs.promises.unlink(req.file.path).catch(() => {});
     return;
@@ -694,15 +708,23 @@ router.post('/:id/import', requireAuth, upload.single('file'), async (req, res, 
     const queryTarget = typeof req.query.target === 'string' ? req.query.target : undefined;
 
     // Deliberately not awaited — this runs after the response is sent.
-    dispatchImport({
-      db,
-      credentials: { username: cred.username, password },
-      connectionUrl,
-      containerName,
-      file,
-      queryTarget,
-      onProgress: (processed, total) => updateImportJob(jobId, { processed, total }),
-    })
+    // The import executes in a worker thread (see importRunner/importWorker):
+    // parsing a 200 MB upload is CPU-bound, and on the main thread it froze
+    // the event loop, failed the /healthz healthcheck, and got the container
+    // restarted mid-import — which is what made big imports "stick" and
+    // kicked users to the login page. workerData is structured-cloned, so
+    // only plain serializable fields go across.
+    runImport(
+      {
+        db: { type: db.type, dbName: db.dbName },
+        credentials: { username: cred.username, password },
+        connectionUrl,
+        containerName,
+        file: { originalname: file.originalname, path: file.path },
+        queryTarget,
+      },
+      (processed, total) => updateImportJob(jobId, { processed, total })
+    )
       .then((result) => {
         updateImportJob(jobId, { status: 'done', result: { file: file.originalname, ...result } });
       })

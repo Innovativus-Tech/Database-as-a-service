@@ -79,6 +79,12 @@ services:
       REDIS_URL: redis://default:${REDIS_PASSWORD}@customdb-redis:6379
       REDIS_PUBLIC_HOST: ${VPS_HOST}
       REDIS_PUBLIC_PORT: 6380
+      MAIL_FROM: ${MAIL_FROM:-CustomDB <no-reply@customdb.local>}
+      SMTP_URL: ${SMTP_URL:-}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
       # libuv thread pool size. Node's default is 4 — too small when a
       # background fs.rm (deleting a multi-GB data dir) can monopolize all
       # of them, queueing bcrypt.compare from concurrent login attempts.

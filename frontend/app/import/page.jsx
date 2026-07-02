@@ -89,7 +89,10 @@ function ProgressRing({ percent }) {
   const r = 34;
   const circumference = 2 * Math.PI * r;
   const indeterminate = percent == null;
-  const dashoffset = indeterminate ? circumference * 0.7 : circumference * (1 - percent / 100);
+  // Clamp — the backend's CSV row total is an estimate, so processed can
+  // slightly overshoot it near the end.
+  const clamped = indeterminate ? null : Math.max(0, Math.min(100, percent));
+  const dashoffset = indeterminate ? circumference * 0.7 : circumference * (1 - clamped / 100);
   return (
     <svg
       width="80" height="80" viewBox="0 0 80 80"
@@ -206,9 +209,15 @@ export default function ImportPage() {
     setStep(4);
     try {
       const { jobId } = await api.importFile(databaseId, file, target || undefined);
+      // Tolerate transient poll failures — while the backend is busy inserting
+      // a large file, an occasional request can time out or blip. Only give up
+      // on a real auth failure, a lost job, or many consecutive misses.
+      let consecutiveFailures = 0;
+      const MAX_CONSECUTIVE_FAILURES = 10;
       pollRef.current = setInterval(async () => {
         try {
           const status = await api.getImportJobStatus(databaseId, jobId);
+          consecutiveFailures = 0;
           setJobStatus(status);
           if (status.status === 'done') {
             clearInterval(pollRef.current);
@@ -222,11 +231,26 @@ export default function ImportPage() {
             toast.error(status.error);
           }
         } catch (err) {
-          clearInterval(pollRef.current);
-          setError(err.message);
-          setBusy(false);
+          if (err?.status === 401) {
+            clearInterval(pollRef.current);
+            setError('Your session expired. Log in again — the import may still be running on the server.');
+            setBusy(false);
+            return;
+          }
+          if (err?.status === 404) {
+            clearInterval(pollRef.current);
+            setError('Lost track of the import job (the server may have restarted). Check the database to see whether the data arrived.');
+            setBusy(false);
+            return;
+          }
+          consecutiveFailures += 1;
+          if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+            clearInterval(pollRef.current);
+            setError('Can’t reach the server to check import progress. The import may still be running — check the database in a minute.');
+            setBusy(false);
+          }
         }
-      }, 500);
+      }, 1000);
     } catch (err) {
       setError(err.message);
       toast.error(err.message);

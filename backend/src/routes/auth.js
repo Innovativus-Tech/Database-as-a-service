@@ -1,9 +1,11 @@
 const express = require('express');
+const crypto = require('crypto');
 const bcrypt = require('bcrypt');
 const { authenticator } = require('otplib');
 const qrcode = require('qrcode');
 const prisma = require('../prisma');
 const { createSession, requireAuth, invalidateSession } = require('../middleware/auth');
+const { sendPasswordResetEmail } = require('../services/email');
 const {
   stopAndRemoveContainer,
   removeDataDir,
@@ -15,9 +17,40 @@ const router = express.Router();
 
 const BCRYPT_ROUNDS = 12;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const PASSWORD_RESET_TTL_MS = 30 * 60 * 1000;
 
 const FREE_DB_LIMIT = 5;
 const FREE_STORAGE_BYTES = 10 * 1024 * 1024 * 1024; // 10 GB
+
+// Real (valid-format) hash of a throwaway string, computed once at startup.
+// Used to equalize response timing when the account doesn't exist — a
+// malformed hash string makes bcrypt.compare bail out instantly, which is a
+// measurable timing signal for user enumeration.
+const DUMMY_HASH = bcrypt.hashSync('timing-equalization-dummy', BCRYPT_ROUNDS);
+
+// Minimal in-memory rate limiter for unauthenticated, abusable endpoints
+// (login brute force, forgot-password email spam). Single-process deployment,
+// so a Map is enough — no Redis dependency for the hot auth path.
+const rateBuckets = new Map(); // key -> [timestamps]
+function rateLimit(key, maxHits, windowMs) {
+  const now = Date.now();
+  const hits = (rateBuckets.get(key) || []).filter((t) => now - t < windowMs);
+  if (hits.length >= maxHits) return false;
+  hits.push(now);
+  rateBuckets.set(key, hits);
+  return true;
+}
+// Sweep stale buckets so the Map can't grow unbounded.
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, hits] of rateBuckets) {
+    if (hits.every((t) => now - t > 60 * 60 * 1000)) rateBuckets.delete(key);
+  }
+}, 10 * 60 * 1000).unref();
+
+function clientIp(req) {
+  return (req.headers['x-forwarded-for']?.split(',')[0].trim()) || req.ip || 'unknown';
+}
 
 function validateCredentials(body) {
   const email = typeof body?.email === 'string' ? body.email.trim().toLowerCase() : '';
@@ -41,6 +74,21 @@ function publicUser(user) {
     twoFactorEnabled: user.twoFactorEnabled,
     createdAt: user.createdAt,
   };
+}
+
+function normalizeEmail(value) {
+  return typeof value === 'string' ? value.trim().toLowerCase() : '';
+}
+
+function hashResetToken(token) {
+  return crypto.createHash('sha256').update(token).digest('hex');
+}
+
+function getFrontendOrigin(req) {
+  if (process.env.FRONTEND_ORIGIN) return process.env.FRONTEND_ORIGIN.replace(/\/+$/, '');
+  const proto = req.get('x-forwarded-proto') || req.protocol || 'http';
+  const host = req.get('x-forwarded-host') || req.get('host') || 'localhost:3030';
+  return `${proto}://${host}`;
 }
 
 router.post('/signup', async (req, res, next) => {
@@ -73,9 +121,13 @@ router.post('/login', async (req, res, next) => {
     const { error, email, password } = validateCredentials(req.body);
     if (error) return res.status(400).json({ error });
 
+    if (!rateLimit(`login:${clientIp(req)}`, 20, 15 * 60 * 1000)) {
+      return res.status(429).json({ error: 'Too many login attempts. Try again in a few minutes.' });
+    }
+
     const user = await prisma.user.findUnique({ where: { email } });
     if (!user) {
-      await bcrypt.compare(password, '$2b$12$invalidinvalidinvalidinvalidinvalidinvalidinvalidinvalidi');
+      await bcrypt.compare(password, DUMMY_HASH);
       return res.status(401).json({ error: 'Invalid email or password' });
     }
 
@@ -91,6 +143,101 @@ router.post('/login', async (req, res, next) => {
 
     const token = await createSession(user, req);
     res.json({ user: publicUser(user), token });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post('/forgot-password', async (req, res, next) => {
+  try {
+    const email = normalizeEmail(req.body?.email);
+    if (!EMAIL_RE.test(email)) return res.status(400).json({ error: 'Invalid email address' });
+
+    if (!rateLimit(`forgot:${clientIp(req)}`, 5, 15 * 60 * 1000) ||
+        !rateLimit(`forgot-email:${email}`, 3, 15 * 60 * 1000)) {
+      return res.status(429).json({ error: 'Too many reset requests. Try again in a few minutes.' });
+    }
+
+    // Opportunistic cleanup — expired tokens have no value, don't let the
+    // table grow forever.
+    prisma.passwordResetToken.deleteMany({ where: { expiresAt: { lt: new Date() } } }).catch(() => {});
+
+    const user = await prisma.user.findUnique({ where: { email } });
+    if (user) {
+      const token = crypto.randomBytes(32).toString('base64url');
+      const tokenHash = hashResetToken(token);
+      const expiresAt = new Date(Date.now() + PASSWORD_RESET_TTL_MS);
+
+      await prisma.$transaction([
+        prisma.passwordResetToken.updateMany({
+          where: { userId: user.id, usedAt: null },
+          data: { usedAt: new Date() },
+        }),
+        prisma.passwordResetToken.create({
+          data: { userId: user.id, tokenHash, expiresAt },
+        }),
+      ]);
+
+      const resetUrl = `${getFrontendOrigin(req)}/reset-password?token=${encodeURIComponent(token)}`;
+      // Fire-and-forget: a slow or failing SMTP server must not 500 this
+      // request (that would reveal the account exists) or delay the response
+      // (a timing signal for the same thing). Failures are logged with the
+      // reset link so an operator can still hand it to the user.
+      sendPasswordResetEmail({ to: user.email, resetUrl }).catch((err) => {
+        console.error(`[password-reset] email send failed for ${user.email}: ${err.message}. Link: ${resetUrl}`);
+      });
+    } else {
+      await bcrypt.compare('dummy-password', DUMMY_HASH);
+    }
+
+    res.json({ ok: true, message: 'If that email exists, a reset link has been sent.' });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post('/reset-password', async (req, res, next) => {
+  try {
+    if (!rateLimit(`reset:${clientIp(req)}`, 10, 15 * 60 * 1000)) {
+      return res.status(429).json({ error: 'Too many attempts. Try again in a few minutes.' });
+    }
+
+    const token = typeof req.body?.token === 'string' ? req.body.token.trim() : '';
+    const newPassword = typeof req.body?.password === 'string' ? req.body.password : '';
+    if (!token) return res.status(400).json({ error: 'Reset token is required' });
+    if (newPassword.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
+
+    const tokenHash = hashResetToken(token);
+    const resetToken = await prisma.passwordResetToken.findUnique({
+      where: { tokenHash },
+      include: { user: true },
+    });
+
+    if (!resetToken || resetToken.usedAt || resetToken.expiresAt <= new Date()) {
+      return res.status(400).json({ error: 'Reset link is invalid or expired' });
+    }
+
+    const passwordHash = await bcrypt.hash(newPassword, BCRYPT_ROUNDS);
+    const activeSessions = await prisma.session.findMany({
+      where: { userId: resetToken.userId, revokedAt: null },
+      select: { jti: true },
+    });
+
+    await prisma.$transaction([
+      prisma.user.update({ where: { id: resetToken.userId }, data: { passwordHash } }),
+      prisma.passwordResetToken.update({ where: { id: resetToken.id }, data: { usedAt: new Date() } }),
+      prisma.passwordResetToken.updateMany({
+        where: { userId: resetToken.userId, usedAt: null },
+        data: { usedAt: new Date() },
+      }),
+      prisma.session.updateMany({
+        where: { userId: resetToken.userId, revokedAt: null },
+        data: { revokedAt: new Date() },
+      }),
+    ]);
+    for (const s of activeSessions) invalidateSession(s.jti);
+
+    res.json({ ok: true });
   } catch (err) {
     next(err);
   }

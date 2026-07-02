@@ -73,6 +73,11 @@ export default function LoginPage() {
                 placeholder="••••••••"
                 error={error}
               />
+              <div className="text-right">
+                <Link href="/forgot-password" className="text-sm text-text-secondary underline-offset-4 hover:text-text-primary hover:underline">
+                  Forgot password?
+                </Link>
+              </div>
             </>
           ) : (
             <>

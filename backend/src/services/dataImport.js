@@ -3,7 +3,7 @@ const path = require('path');
 const os = require('os');
 const util = require('util');
 const { execFile } = require('child_process');
-const { parse: csvParse } = require('csv-parse/sync');
+const { parse: csvParseStream } = require('csv-parse');
 const AdmZip = require('adm-zip');
 const { MongoClient } = require('mongodb');
 const { Client: PgClient } = require('pg');
@@ -20,6 +20,32 @@ function inferTargetFromFilename(originalName, fallback) {
   const base = path.basename(originalName, path.extname(originalName));
   const cleaned = base.replace(/[^a-zA-Z0-9_]/g, '_').replace(/^[^a-zA-Z]+/, '');
   return validIdent(cleaned) ? cleaned : fallback;
+}
+
+// Streamed newline count so progress bars have a total without buffering the
+// file. Approximate when quoted fields contain embedded newlines — the UI
+// clamps at 100%, so an estimate is fine. Subtracts the header row.
+function countCsvRows(filePath) {
+  return new Promise((resolve, reject) => {
+    let count = 0;
+    let lastByte = null;
+    const stream = fs.createReadStream(filePath);
+    stream.on('data', (buf) => {
+      for (let i = 0; i < buf.length; i++) if (buf[i] === 10) count++;
+      lastByte = buf[buf.length - 1];
+    });
+    stream.on('end', () => {
+      if (lastByte !== null && lastByte !== 10) count++; // no trailing newline
+      resolve(Math.max(0, count - 1));
+    });
+    stream.on('error', reject);
+  });
+}
+
+function csvRecordStream(filePath) {
+  return fs.createReadStream(filePath).pipe(
+    csvParseStream({ columns: true, skip_empty_lines: true, trim: true })
+  );
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -55,25 +81,36 @@ async function importJsonToMongo({ connectionUrl, dbName, collection, filePath, 
 
 // ──────────────────────────────────────────────────────────────────────────────
 // CSV → MongoDB (rows become documents)
+// Streams the file through the parser in batches — a 200 MB CSV never has to
+// fit in memory as one giant array (which used to OOM the container).
 // ──────────────────────────────────────────────────────────────────────────────
 async function importCsvToMongo({ connectionUrl, dbName, collection, filePath, onProgress }) {
-  const raw = await fs.promises.readFile(filePath, 'utf8');
-  const records = csvParse(raw, { columns: true, skip_empty_lines: true, trim: true });
-  if (records.length === 0) return { count: 0, target: collection };
-  onProgress?.(0, records.length);
+  const totalEstimate = await countCsvRows(filePath);
+  onProgress?.(0, totalEstimate || null);
 
   const client = new MongoClient(connectionUrl);
   try {
     await client.connect();
     const col = client.db(dbName).collection(collection);
     let inserted = 0;
-    const CHUNK = 500;
-    for (let start = 0; start < records.length; start += CHUNK) {
-      const chunk = records.slice(start, start + CHUNK);
-      const result = await col.insertMany(chunk);
-      inserted += result.insertedCount;
-      onProgress?.(inserted, records.length);
+    let batch = [];
+    const CHUNK = 1000;
+    // for-await pauses the parser stream between batches, so backpressure
+    // keeps memory flat regardless of file size.
+    for await (const record of csvRecordStream(filePath)) {
+      batch.push(record);
+      if (batch.length >= CHUNK) {
+        const result = await col.insertMany(batch);
+        inserted += result.insertedCount;
+        batch = [];
+        onProgress?.(inserted, totalEstimate || null);
+      }
     }
+    if (batch.length > 0) {
+      const result = await col.insertMany(batch);
+      inserted += result.insertedCount;
+    }
+    onProgress?.(inserted, totalEstimate || inserted || null);
     return { count: inserted, target: collection };
   } finally {
     await client.close().catch(() => {});
@@ -84,47 +121,60 @@ async function importCsvToMongo({ connectionUrl, dbName, collection, filePath, o
 // CSV → PostgreSQL (auto-create TEXT-column table)
 // ──────────────────────────────────────────────────────────────────────────────
 async function importCsvToPostgres({ connectionUrl, table, filePath, onProgress }) {
-  const raw = await fs.promises.readFile(filePath, 'utf8');
-  const records = csvParse(raw, { columns: true, skip_empty_lines: true, trim: true });
-  if (records.length === 0) return { count: 0, target: table };
-  onProgress?.(0, records.length);
-
-  const columns = Object.keys(records[0]);
-  for (const col of columns) {
-    if (!validIdent(col)) {
-      throw Object.assign(new Error(`Invalid CSV column name: "${col}". Must match ${IDENT_RE}`), { status: 400 });
-    }
-  }
+  const totalEstimate = await countCsvRows(filePath);
+  onProgress?.(0, totalEstimate || null);
 
   const client = new PgClient({ connectionString: connectionUrl });
   await client.connect();
   try {
-    const colsSql = columns.map((c) => `"${c}" TEXT`).join(', ');
-    await client.query(`DROP TABLE IF EXISTS "${table}"`);
-    await client.query(`CREATE TABLE "${table}" (${colsSql})`);
-
-    // Batch INSERT — chunks of 500 rows.
-    const placeholders = (row, offset) =>
-      `(${columns.map((_, i) => `$${offset + i + 1}`).join(', ')})`;
-    const colsList = columns.map((c) => `"${c}"`).join(', ');
-
+    let columns = null;
+    let colsList = null;
+    let chunkSize = 500;
     let inserted = 0;
-    const CHUNK = 500;
-    for (let start = 0; start < records.length; start += CHUNK) {
-      const chunk = records.slice(start, start + CHUNK);
+    let batch = [];
+
+    const flush = async () => {
+      if (batch.length === 0) return;
       const values = [];
       const tuples = [];
-      chunk.forEach((row, idx) => {
-        tuples.push(placeholders(row, idx * columns.length));
+      batch.forEach((row, idx) => {
+        const offset = idx * columns.length;
+        tuples.push(`(${columns.map((_, i) => `$${offset + i + 1}`).join(', ')})`);
         for (const c of columns) values.push(row[c] ?? null);
       });
       await client.query(
         `INSERT INTO "${table}" (${colsList}) VALUES ${tuples.join(', ')}`,
         values
       );
-      inserted += chunk.length;
-      onProgress?.(inserted, records.length);
+      inserted += batch.length;
+      batch = [];
+      onProgress?.(inserted, totalEstimate || null);
+    };
+
+    // Stream rows through the parser — table is created lazily from the first
+    // record's keys, and batches flush as they fill so memory stays flat.
+    for await (const record of csvRecordStream(filePath)) {
+      if (!columns) {
+        columns = Object.keys(record);
+        for (const col of columns) {
+          if (!validIdent(col)) {
+            throw Object.assign(new Error(`Invalid CSV column name: "${col}". Must match ${IDENT_RE}`), { status: 400 });
+          }
+        }
+        // Postgres caps bind parameters at 65535 per statement — size batches
+        // so wide CSVs don't blow past it.
+        chunkSize = Math.max(1, Math.min(1000, Math.floor(60000 / columns.length)));
+        colsList = columns.map((c) => `"${c}"`).join(', ');
+        const colsSql = columns.map((c) => `"${c}" TEXT`).join(', ');
+        await client.query(`DROP TABLE IF EXISTS "${table}"`);
+        await client.query(`CREATE TABLE "${table}" (${colsSql})`);
+      }
+      batch.push(record);
+      if (batch.length >= chunkSize) await flush();
     }
+    await flush();
+    if (!columns) return { count: 0, target: table };
+    onProgress?.(inserted, totalEstimate || inserted || null);
     return { count: inserted, target: table };
   } finally {
     await client.end().catch(() => {});

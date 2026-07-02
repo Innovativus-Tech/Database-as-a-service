@@ -49,6 +49,8 @@ export const api = {
   signup: ({ email, password, fullName, organizationName }) =>
     request('/api/auth/signup', { method: 'POST', body: { email, password, fullName, organizationName } }),
   login:  (email, password, totp) => request('/api/auth/login',  { method: 'POST', body: { email, password, ...(totp ? { totp } : {}) } }),
+  forgotPassword: (email) => request('/api/auth/forgot-password', { method: 'POST', body: { email } }),
+  resetPassword:  ({ token, password }) => request('/api/auth/reset-password', { method: 'POST', body: { token, password } }),
   me:     () => request('/api/auth/me'),
   updateProfile:  (data) => request('/api/auth/me', { method: 'PATCH', body: data }),
   changePassword: (data) => request('/api/auth/password', { method: 'POST', body: data }),
