@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useState, useRef } from 'react';
-import { useParams, useRouter } from 'next/navigation';
+import { useParams, useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
 import { toast } from 'sonner';
 import {
@@ -31,6 +31,7 @@ const TABS = ['Overview', 'Browse Data', 'Import', 'Settings'];
 export default function DatabaseDetailPage() {
   const { id } = useParams();
   const router = useRouter();
+  const searchParams = useSearchParams();
   const { loading: authLoading } = useRequireAuth();
   const { logout } = useAuth();
 
@@ -38,7 +39,9 @@ export default function DatabaseDetailPage() {
   const [stats, setStats] = useState(null);
   const [error, setError] = useState(null);
   const [showPassword, setShowPassword] = useState(false);
-  const [activeTab, setActiveTab] = useState('Overview');
+  // ?tab=browse deep-links straight to the data browser (dashboard "Browse" button)
+  const [activeTab, setActiveTab] = useState(() =>
+    searchParams.get('tab') === 'browse' ? 'Browse Data' : 'Overview');
   const [urlFormat, setUrlFormat] = useState('sdk'); // 'sdk' or 'standard'
 
   const [importBusy, setImportBusy] = useState(false);

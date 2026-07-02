@@ -11,7 +11,6 @@ import {
   HardDrive,
   Activity,
   ArrowRight,
-  MoreHorizontal,
 } from 'lucide-react';
 import { api } from '@/lib/api';
 import { useRequireAuth, useAuth } from '@/lib/auth';
@@ -145,7 +144,7 @@ function DbRow({ db, idx }) {
       </div>
 
       {/* Action buttons */}
-      <Link href={`/databases/${db.id}`}>
+      <Link href={`/databases/${db.id}?tab=browse`}>
         <button className="h-8 px-3 border border-border rounded text-sm font-medium text-text-primary hover:bg-bg-inset transition-colors">
           Browse
         </button>
@@ -155,11 +154,6 @@ function DbRow({ db, idx }) {
           Connect
         </button>
       </Link>
-
-      {/* More menu */}
-      <button className="p-1 text-text-secondary hover:text-text-primary transition-colors">
-        <MoreHorizontal className="h-[18px] w-[18px]" strokeWidth={1.75} />
-      </button>
     </motion.div>
   );
 }
