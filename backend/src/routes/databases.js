@@ -72,6 +72,13 @@ function uploadSingleFile(req, res, next) {
 
 const router = express.Router();
 
+// Container names whose background teardown (DELETE handler) is still in
+// flight. Creating a database re-derives the same container name + data dir
+// from (userId, dbName), so recreating one with the same name while its old
+// teardown is running would let the teardown destroy the NEW container and
+// wipe its fresh data dir. Block creation until cleanup finishes.
+const tearingDown = new Set();
+
 const DB_NAME_RE = /^[a-zA-Z][a-zA-Z0-9_-]{2,39}$/;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -126,11 +133,15 @@ router.post('/create', requireAuth, async (req, res, next) => {
     return res.status(409).json({ error: 'You already have a database with that name' });
   }
 
-  const ownedCount = await prisma.database.count({
-    where: { userId: req.user.id, status: { not: 'deleted' } },
-  });
-  if (ownedCount >= FREE_DB_LIMIT) {
-    return res.status(403).json({ error: `Free tier is limited to ${FREE_DB_LIMIT} databases. Delete one first.` });
+  // FREE_DB_LIMIT is Infinity unless the DB_LIMIT env var caps it, so this
+  // check is a no-op for the internal deployment.
+  if (Number.isFinite(FREE_DB_LIMIT)) {
+    const ownedCount = await prisma.database.count({
+      where: { userId: req.user.id, status: { not: 'deleted' } },
+    });
+    if (ownedCount >= FREE_DB_LIMIT) {
+      return res.status(403).json({ error: `This instance is limited to ${FREE_DB_LIMIT} databases per user. Delete one first.` });
+    }
   }
 
   const port = await getNextAvailablePort(type);
@@ -139,6 +150,10 @@ router.post('/create', requireAuth, async (req, res, next) => {
   const host = process.env.VPS_HOST || 'localhost';
   const routing = 'nginx';
   const { containerName } = deriveNames({ type, dbName: name, userId: req.user.id });
+
+  if (tearingDown.has(containerName)) {
+    return res.status(409).json({ error: 'A database with that name was just deleted and is still being cleaned up. Try again in ~30 seconds.' });
+  }
 
   // Both engines now ship with TLS by default. Mongo terminates at nginx
   // (immediate TLS handshake on the wire); Postgres terminates inside its
@@ -799,22 +814,29 @@ router.delete('/:id', requireAuth, async (req, res, next) => {
 
     // Now do the actual filesystem + container teardown in the background.
     // setImmediate yields to the event loop so the response flushes first.
-    // Errors only get logged — the user has already moved on.
+    // Errors only get logged — the user has already moved on. While this
+    // runs, `tearingDown` blocks re-creation of the same name (same derived
+    // container name + data dir) so the teardown can't destroy a fresh DB.
+    tearingDown.add(containerName);
     setImmediate(async () => {
       try {
-        await stopAndRemoveContainer(containerName);
-      } catch (e) { console.error('[delete:bg] container teardown:', e.message); }
-      try {
-        await removeDataDir(dataDir);
-      } catch (e) { console.error('[delete:bg] data dir cleanup:', e.message); }
-      try {
-        await removeInitScript(containerName);
-      } catch (e) { console.error('[delete:bg] init script cleanup:', e.message); }
-      if (db.routing === 'nginx') {
-        try { await removeStreamBlock(db.port); await reloadNginx(); }
-        catch (e) { console.error('[delete:bg] nginx cleanup:', e.message); }
+        try {
+          await stopAndRemoveContainer(containerName);
+        } catch (e) { console.error('[delete:bg] container teardown:', e.message); }
+        try {
+          await removeDataDir(dataDir);
+        } catch (e) { console.error('[delete:bg] data dir cleanup:', e.message); }
+        try {
+          await removeInitScript(containerName);
+        } catch (e) { console.error('[delete:bg] init script cleanup:', e.message); }
+        if (db.routing === 'nginx') {
+          try { await removeStreamBlock(db.port); await reloadNginx(); }
+          catch (e) { console.error('[delete:bg] nginx cleanup:', e.message); }
+        }
+        console.log(`[delete:bg] finished teardown of ${db.dbName} (${db.id})`);
+      } finally {
+        tearingDown.delete(containerName);
       }
-      console.log(`[delete:bg] finished teardown of ${db.dbName} (${db.id})`);
     });
   } catch (err) {
     next(err);

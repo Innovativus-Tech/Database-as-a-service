@@ -335,11 +335,13 @@ export default function NewDatabasePage() {
               </div>
               <div className="flex justify-between">
                 <span className="text-sm text-text-secondary">Host</span>
-                <span className="text-sm text-text-primary font-mono">db.customdb.io</span>
+                <span className="text-sm text-text-primary font-mono">
+                  {(process.env.NEXT_PUBLIC_API_URL || '').replace(/^https?:\/\/(api\.)?/, '') || 'assigned on create'}
+                </span>
               </div>
               <div className="flex justify-between">
                 <span className="text-sm text-text-secondary">Storage</span>
-                <span className="text-sm text-text-primary">Free tier · 2.5 GB</span>
+                <span className="text-sm text-text-primary">Self-hosted · no cap</span>
               </div>
             </div>
           </div>

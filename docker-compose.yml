@@ -79,6 +79,9 @@ services:
       REDIS_URL: redis://default:${REDIS_PASSWORD}@customdb-redis:6379
       REDIS_PUBLIC_HOST: ${VPS_HOST}
       REDIS_PUBLIC_PORT: 6380
+      # Optional per-user caps. Empty = unlimited (internal deployment).
+      DB_LIMIT: ${DB_LIMIT:-}
+      STORAGE_LIMIT_GB: ${STORAGE_LIMIT_GB:-}
       MAIL_FROM: ${MAIL_FROM:-CustomDB <no-reply@customdb.local>}
       SMTP_URL: ${SMTP_URL:-}
       SMTP_HOST: ${SMTP_HOST:-}
@@ -122,6 +125,13 @@ services:
     ports:
       - "3030:3030"
     restart: unless-stopped
+    healthcheck:
+      # Hits the app's own /api/healthz route — no auth, no backend call.
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3030/api/healthz || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
 
   # Self-hosted Redis for caching from consumer apps + optional platform use.
   # - --requirepass: REQUIRED. Without auth, port 6379 on the public internet
@@ -183,6 +193,14 @@ services:
       - "5433-5532:5433-5532"
     networks: [customdb-network]
     restart: unless-stopped
+    healthcheck:
+      # Probes the local-only HTTP health listener added in nginx.conf —
+      # proves nginx loaded its config and is accepting connections.
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8999/healthz || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
     # Default ulimit (1024) caps the proxy to ~512 effective concurrent
     # connections — visible as "4096 worker_connections exceed open file
     # resource limit: 1024" in nginx logs. Bumping nofile lets the proxy

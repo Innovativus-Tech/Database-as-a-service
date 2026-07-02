@@ -176,8 +176,6 @@ export default function DashboardPage() {
   const dbs = data?.databases ?? [];
   const activeCount = dbs.filter((d) => d.status === 'active').length;
   const totalStorage = dbs.reduce((acc, d) => acc + (d.storageUsed || 0), 0);
-  const STORAGE_CAP = 10 * 1024 * 1024 * 1024; // 10 GB
-  const storagePct = Math.min(100, (totalStorage / STORAGE_CAP) * 100);
   const mongoCount = dbs.filter(d => d.type === 'nosql').length;
   const pgCount = dbs.filter(d => d.type === 'sql').length;
 
@@ -217,8 +215,7 @@ export default function DashboardPage() {
               <StatCard
                 label="Storage Used"
                 value={fmtBytes(totalStorage)}
-                sub={`of ${fmtBytes(STORAGE_CAP)} free tier`}
-                progress={storagePct}
+                sub="self-hosted · no cap"
               />
               <StatCard
                 label="Active Connections · Live now"

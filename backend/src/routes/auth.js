@@ -19,8 +19,13 @@ const BCRYPT_ROUNDS = 12;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const PASSWORD_RESET_TTL_MS = 30 * 60 * 1000;
 
-const FREE_DB_LIMIT = 5;
-const FREE_STORAGE_BYTES = 10 * 1024 * 1024 * 1024; // 10 GB
+// Plan limits. This deployment is self-hosted for one organization, so both
+// default to UNLIMITED. Set DB_LIMIT / STORAGE_LIMIT_GB env vars to re-enable
+// caps if the instance is ever opened up to outside users.
+const FREE_DB_LIMIT = Number(process.env.DB_LIMIT) > 0 ? Number(process.env.DB_LIMIT) : Infinity;
+const FREE_STORAGE_BYTES = Number(process.env.STORAGE_LIMIT_GB) > 0
+  ? Number(process.env.STORAGE_LIMIT_GB) * 1024 * 1024 * 1024
+  : Infinity;
 
 // Real (valid-format) hash of a throwaway string, computed once at startup.
 // Used to equalize response timing when the account doesn't exist — a
@@ -428,9 +433,10 @@ router.get('/usage', requireAuth, async (req, res, next) => {
     res.json({
       plan: user.plan,
       databaseCount: dbs.length,
-      databaseLimit: FREE_DB_LIMIT,
+      // Infinity doesn't survive JSON — null means "no limit" to the client.
+      databaseLimit: Number.isFinite(FREE_DB_LIMIT) ? FREE_DB_LIMIT : null,
       storageUsed,
-      storageLimit: FREE_STORAGE_BYTES,
+      storageLimit: Number.isFinite(FREE_STORAGE_BYTES) ? FREE_STORAGE_BYTES : null,
     });
   } catch (err) {
     next(err);

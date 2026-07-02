@@ -42,7 +42,9 @@ app.use(cors(corsOptions));
 // belt-and-suspenders for the login path.
 app.options('*', cors(corsOptions));
 
-app.use(express.json({ limit: '1mb' }));
+// 17mb: MongoDB documents can be up to 16 MB, and the document editor PUTs
+// the whole document as a JSON body. 1 MB silently rejected legitimate edits.
+app.use(express.json({ limit: '17mb' }));
 app.use(morgan(process.env.NODE_ENV === 'development' ? 'dev' : 'combined'));
 
 // Root path — answer 200 OK so Coolify-Traefik's default healthcheck doesn't

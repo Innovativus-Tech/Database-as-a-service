@@ -103,12 +103,36 @@ async function listMongoCollections(connectionUrl, dbName) {
   });
 }
 
+// The browse filter arrives as plain JSON, which can't express ObjectId — so
+// a filter like {"_id": "665f1c..."} would never match documents whose _id is
+// a real ObjectId. Coerce 24-hex _id strings (including inside $in/$eq/$ne)
+// the way Compass/Atlas do.
+function coerceMongoFilterIds(filter) {
+  if (!filter || typeof filter !== 'object' || !('_id' in filter)) return filter;
+  const coerce = (v) => (typeof v === 'string' ? toMongoId(v) : v);
+  const idVal = filter._id;
+  let coerced = idVal;
+  if (typeof idVal === 'string') {
+    coerced = coerce(idVal);
+  } else if (idVal && typeof idVal === 'object' && !Array.isArray(idVal)) {
+    coerced = { ...idVal };
+    for (const op of ['$eq', '$ne']) {
+      if (typeof coerced[op] === 'string') coerced[op] = coerce(coerced[op]);
+    }
+    for (const op of ['$in', '$nin']) {
+      if (Array.isArray(coerced[op])) coerced[op] = coerced[op].map(coerce);
+    }
+  }
+  return { ...filter, _id: coerced };
+}
+
 async function browseMongoCollection({ connectionUrl, dbName, collection, skip = 0, limit = 50, filter = {} }) {
   return withMongo(connectionUrl, async (client) => {
     const col = client.db(dbName).collection(collection);
+    const query = coerceMongoFilterIds(filter);
     const [rows, total] = await Promise.all([
-      col.find(filter).skip(skip).limit(limit).toArray(),
-      col.countDocuments(filter),
+      col.find(query).skip(skip).limit(limit).toArray(),
+      col.countDocuments(query),
     ]);
     return { total, skip, limit, rows };
   });

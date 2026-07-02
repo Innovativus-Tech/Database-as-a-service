@@ -76,7 +76,6 @@ export default function UsagePage() {
   });
 
   const totalStorage = statQueries.reduce((acc, q) => acc + (q.data?.storage?.bytes || 0), 0);
-  const STORAGE_CAP = 10 * 1024 * 1024 * 1024;
   const activeCount = statQueries.filter((q) => q.data?.container?.running).length;
 
   return (
@@ -97,9 +96,8 @@ export default function UsagePage() {
               <StatCard
                 label="Storage Used"
                 value={fmtBytes(totalStorage)}
-                sub={`of ${fmtBytes(STORAGE_CAP)} on free plan`}
+                sub="self-hosted · no cap"
                 icon={HardDrive}
-                progress={(totalStorage / STORAGE_CAP) * 100}
               />
               <StatCard
                 label="Active Now"
