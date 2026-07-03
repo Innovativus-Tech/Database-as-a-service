@@ -1,4 +1,7 @@
-const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:4000';
+const CONFIGURED_API_URL = process.env.NEXT_PUBLIC_API_URL || '';
+const API_URL = typeof window === 'undefined'
+  ? (CONFIGURED_API_URL || 'http://localhost:4000')
+  : '';
 
 const TOKEN_KEY = 'customdb.token';
 const EMAIL_KEY = 'customdb.email';

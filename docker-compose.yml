@@ -132,6 +132,7 @@ services:
     container_name: customdb-frontend
     environment:
       NEXT_PUBLIC_API_URL: ${PUBLIC_API_URL}
+      INTERNAL_API_URL: http://backend:4000
     ports:
       - "3030:3030"
     networks:
@@ -139,6 +140,9 @@ services:
       # to the Next.js service. Publishing 3030 is still useful for direct VPS
       # access, but proxy routing needs shared network reachability.
       - coolify
+      # Internal app network = so same-origin /api/* requests can be proxied
+      # from Next.js to the backend even if the public API domain is down.
+      - customdb-network
     restart: unless-stopped
     healthcheck:
       # Hits the app's own /api/healthz route — no auth, no backend call.
