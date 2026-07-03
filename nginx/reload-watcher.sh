@@ -11,7 +11,7 @@
 # socket, and works identically under plain compose and Coolify.
 STREAM_DIR=/etc/nginx/stream.d
 
-while inotifywait -q -e create -e modify -e delete -e move "$STREAM_DIR" >/dev/null 2>&1; do
+while inotifywait -q -r -e create -e modify -e delete -e move "$STREAM_DIR" >/dev/null 2>&1; do
   # Debounce: the backend writes the .conf then triggers its own (possibly
   # failing) reload; batch rapid successive changes into one reload.
   sleep 1

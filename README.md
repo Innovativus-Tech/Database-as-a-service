@@ -15,8 +15,8 @@ user are unlimited unless you explicitly set `DB_LIMIT` / `STORAGE_LIMIT_GB`.
                         ┌──────────────────────────── VPS / Docker host ─┐
   browser ── https ──▶  │ frontend (Next.js :3030)                       │
                         │ backend  (Express :4000)──── docker.sock       │
-  mongosh/driver ─────▶ │ nginx TCP proxy (:27018-27117, :5433-5532)     │
-    mongodb://…:27018   │   ├─ customdb-mongo-<user>-<db>   (mongo:7)    │
+  mongosh/driver ─────▶ │ nginx TCP proxy (:27017, :5433-5532)           │
+    mongodb://…:27017   │   ├─ customdb-mongo-<user>-<db>   (mongo:7)    │
     postgresql://…:5433 │   ├─ customdb-pg-<user>-<db>      (postgres:16)│
                         │   └─ … one container per database              │
   redis cache ────────▶ │ redis (:6380, per-DB ACL users)                │
@@ -25,12 +25,13 @@ user are unlimited unless you explicitly set `DB_LIMIT` / `STORAGE_LIMIT_GB`.
 ```
 
 - **backend** provisions one Docker container per user database (via the
-  mounted Docker socket), writes an nginx `stream {}` block per database, and
-  hands out connection strings.
-- **nginx** proxies each public port to the right container by name. Mongo
-  traffic is TLS-terminated at nginx (self-signed cert); Postgres does its own
-  TLS inside the container (STARTTLS-style handshake can't terminate at a TCP
-  proxy).
+  mounted Docker socket), writes nginx stream routing config, and hands out
+  connection strings.
+- **nginx** routes Mongo through a shared gateway port (`27017`) by SNI
+  hostname (`<id>.mongo.<domain>`), so Mongo databases no longer consume one
+  public port each. Legacy Mongo port blocks still work. Postgres still uses
+  one public port per container because its STARTTLS handshake cannot be SNI
+  routed the same way by this simple stream gateway.
 - **redis** provides per-database cache users: each database gets an ACL user
   restricted to keys under `cdb:<dbId>:*`, with credentials derived
   deterministically from the platform secret (nothing stored). ACLs are
@@ -78,8 +79,8 @@ On a non-Coolify host, deploy with the local override or replace the `coolify`
 network with your own reverse-proxy network.
 
 1. **DNS** — point your dashboard domain (e.g. `dbaas.example.com`) and API
-   domain (e.g. `api.dbaas.example.com`) at the host. Database connection
-   strings use `VPS_HOST` verbatim, so that name must resolve publicly.
+   domain (e.g. `api.dbaas.example.com`) at the host. Also point wildcard
+   Mongo gateway DNS (e.g. `*.mongo.dbaas.example.com`) at the host.
 2. **Environment** — copy `.env.example` → `.env` and set real values:
 
    | Variable | Purpose |
@@ -89,16 +90,19 @@ network with your own reverse-proxy network.
    | `META_DB_PASSWORD` | Platform Postgres password. |
    | `REDIS_PASSWORD` | Platform Redis password (public port 6380 — must be strong). |
    | `VPS_HOST` | Public hostname baked into every connection string. |
+   | `MONGO_GATEWAY_DOMAIN` | Wildcard-backed domain for new Mongo DBs, e.g. `mongo.dbaas.example.com`. |
+   | `MONGO_GATEWAY_PORT` | Shared public Mongo gateway port. Default `27017`. |
+   | `MONGO_GATEWAY_ENABLED` | Set `false` to use legacy per-port Mongo routing. |
    | `FRONTEND_ORIGIN` | Dashboard origin, e.g. `https://dbaas.example.com`. CORS for the dashboard API is locked to this origin's registrable domain. |
    | `PUBLIC_API_URL` | Public backend URL, baked into the frontend at build time. |
    | `SMTP_URL` or `SMTP_HOST/PORT/USER/PASS` | Password-reset email. If unset, reset links are printed to backend logs. |
    | `DB_LIMIT`, `STORAGE_LIMIT_GB` | **Optional caps. Empty = unlimited (default).** |
 
-3. **Ports** — open `3030` (or your proxy), the API route, `27018-27117`
-   (Mongo), `5433-5532` (Postgres), `6380` (Redis) in the firewall. Widen the
-   port ranges via `NOSQL_PORT_MIN/MAX`, `SQL_PORT_MIN/MAX` — keep them in
-   sync with the nginx `ports:` ranges in `docker-compose.yml` (each range
-   currently allows 100 databases of that type).
+3. **Ports** — open `3030` (or your proxy), the API route, `27017` (Mongo
+   gateway), `5433-5532` (Postgres), and `6380` (Redis) in the firewall.
+   Keep `27018-27117` open only if you still have legacy Mongo databases
+   created before gateway routing. Widen the Postgres range via
+   `SQL_PORT_MIN/MAX` and keep it in sync with `docker-compose.yml`.
 4. **Deploy** — `docker compose up -d --build`. The backend runs
    `prisma migrate deploy` on start, reconciles user containers, rewrites
    nginx stream configs, and re-provisions Redis ACLs.
@@ -112,7 +116,7 @@ network with your own reverse-proxy network.
 Every database gets two formats (dashboard → database → Overview):
 
 - **Standard** — works with any tool, exactly like Atlas minus SRV records:
-  - Mongo: `mongodb://USER:PASS@HOST:PORT/DB?authSource=admin&tls=true&tlsAllowInvalidCertificates=true`
+  - Mongo: `mongodb://USER:PASS@DBHOST:27017/DB?authSource=admin&tls=true&tlsAllowInvalidCertificates=true`
   - Postgres: `postgresql://USER:PASS@HOST:PORT/DB?sslmode=require`
   - TLS is transport encryption with a self-signed cert (`tlsAllowInvalidCertificates` / `sslmode=require`). To get full
     identity verification like Atlas, install a CA-issued cert in

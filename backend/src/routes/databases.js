@@ -85,6 +85,29 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 
 // Guard for routes with :id — bail with 404 (don't reveal whether row exists)
 // before Prisma gets a malformed UUID and throws.
+function mongoGatewayEnabled() {
+  return process.env.MONGO_GATEWAY_ENABLED !== 'false';
+}
+
+function mongoGatewayDomain() {
+  const explicit = (process.env.MONGO_GATEWAY_DOMAIN || '').trim();
+  if (explicit) return explicit.replace(/^https?:\/\//, '').replace(/\/+$/, '').toLowerCase();
+  const host = (process.env.VPS_HOST || 'localhost').replace(/\/+$/, '').toLowerCase();
+  return `mongo.${host}`;
+}
+
+function mongoGatewayPort() {
+  return Number(process.env.MONGO_GATEWAY_PORT) || 27017;
+}
+
+function mongoGatewayHost() {
+  return `m-${randomToken(8).toLowerCase()}.${mongoGatewayDomain()}`;
+}
+
+function isNetworkRouted(db) {
+  return db.routing === 'nginx' || db.routing === 'mongo-gateway';
+}
+
 function validIdOr404(req, res) {
   if (!UUID_RE.test(req.params.id || '')) {
     res.status(404).json({ error: 'Database not found' });
@@ -145,11 +168,12 @@ router.post('/create', requireAuth, async (req, res, next) => {
     }
   }
 
-  const port = await getNextAvailablePort(type);
+  const useMongoGateway = type === 'nosql' && mongoGatewayEnabled();
+  const port = useMongoGateway ? mongoGatewayPort() : await getNextAvailablePort(type);
   const username = `cdb_${randomToken(6)}`;
   const password = randomToken(24);
-  const host = process.env.VPS_HOST || 'localhost';
-  const routing = 'nginx';
+  const host = useMongoGateway ? mongoGatewayHost() : (process.env.VPS_HOST || 'localhost');
+  const routing = useMongoGateway ? 'mongo-gateway' : 'nginx';
   const { containerName } = deriveNames({ type, dbName: name, userId: req.user.id });
 
   if (tearingDown.has(containerName)) {
@@ -195,7 +219,7 @@ router.post('/create', requireAuth, async (req, res, next) => {
 
     // Add nginx stream block + reload, so clients can reach the new container.
     const internalPort = type === 'nosql' ? 27017 : 5432;
-    await addStreamBlock({ port, containerName, internalPort, tlsEnabled, type });
+    await addStreamBlock({ port, host, containerName, internalPort, tlsEnabled, type, routing });
     await reloadNginx();
 
     const updated = await prisma.database.update({
@@ -214,7 +238,7 @@ router.post('/create', requireAuth, async (req, res, next) => {
     console.error('[databases/create] provisioning failed, rolling back:', err.message);
     try { await stopAndRemoveContainer(containerName); } catch (e) { console.error('cleanup:', e.message); }
     try { await removeInitScript(containerName); } catch (e) { /* best-effort */ }
-    try { await removeStreamBlock(port); await reloadNginx(); } catch (e) { /* best-effort */ }
+    try { await removeStreamBlock(port, host); await reloadNginx(); } catch (e) { /* best-effort */ }
     await prisma.database.delete({ where: { id: database.id } }).catch(() => {});
     return res.status(500).json({ error: 'Failed to provision container', detail: err.message });
   }
@@ -367,9 +391,9 @@ router.post('/:id/start', requireAuth, async (req, res, next) => {
     const password = decrypt(cred.passwordEncrypted);
     const action = await ensureContainerRunning({ db, username: cred.username, password });
 
-    if (db.routing === 'nginx' && db.containerName) {
+    if (isNetworkRouted(db) && db.containerName) {
       const internalPort = db.type === 'nosql' ? 27017 : 5432;
-      await addStreamBlock({ port: db.port, containerName: db.containerName, internalPort, tlsEnabled: !!db.tlsEnabled, type: db.type });
+      await addStreamBlock({ port: db.port, host: db.host, containerName: db.containerName, internalPort, tlsEnabled: !!db.tlsEnabled, type: db.type, routing: db.routing });
       await reloadNginx();
     }
 
@@ -403,7 +427,7 @@ async function loadDatabaseWithUrl(userId, id) {
   // Internal hop is plaintext: it stays on the private customdb-network and
   // talks straight to the user-DB container, bypassing the nginx TLS layer.
   let internalUrl = connectionUrl;
-  if (db.routing === 'nginx' && db.containerName) {
+  if (isNetworkRouted(db) && db.containerName) {
     const internalPort = db.type === 'nosql' ? 27017 : 5432;
     internalUrl = generateConnectionURL(db.type, {
       host: db.containerName,
@@ -727,7 +751,7 @@ router.post('/:id/import', requireAuth, uploadSingleFile, async (req, res, next)
     // Internal hop is always plaintext (skips the nginx TLS layer); only the
     // public path through the proxy needs TLS for new (tlsEnabled) DBs.
     let connectionUrl;
-    if (db.routing === 'nginx' && db.containerName) {
+    if (isNetworkRouted(db) && db.containerName) {
       const internalPort = db.type === 'nosql' ? 27017 : 5432;
       connectionUrl = generateConnectionURL(db.type, {
         host: db.containerName, port: internalPort,
@@ -853,8 +877,8 @@ router.delete('/:id', requireAuth, async (req, res, next) => {
         try {
           await removeInitScript(containerName);
         } catch (e) { console.error('[delete:bg] init script cleanup:', e.message); }
-        if (db.routing === 'nginx') {
-          try { await removeStreamBlock(db.port); await reloadNginx(); }
+        if (isNetworkRouted(db)) {
+          try { await removeStreamBlock(db.port, db.host); await reloadNginx(); }
           catch (e) { console.error('[delete:bg] nginx cleanup:', e.message); }
         }
         console.log(`[delete:bg] finished teardown of ${db.dbName} (${db.id})`);

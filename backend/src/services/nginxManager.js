@@ -17,6 +17,15 @@ function configPath(port) {
   return path.join(streamDir(), `customdb-${port}.conf`);
 }
 
+function gatewayMapDir() {
+  return path.join(streamDir(), 'mongo-gateway');
+}
+
+function gatewayMapPath(host) {
+  const safeHost = String(host).toLowerCase().replace(/[^a-z0-9.-]/g, '_');
+  return path.join(gatewayMapDir(), `${safeHost}.map`);
+}
+
 function blockText({ port, containerName, internalPort, tlsEnabled = false, type = 'nosql' }) {
   // proxy_pass target MUST live in a variable, not a bare literal — nginx
   // resolves a literal hostname once at config-load time, and if that one
@@ -51,17 +60,36 @@ server {
 
 function ensureStreamDir() {
   fs.mkdirSync(streamDir(), { recursive: true });
+  fs.mkdirSync(gatewayMapDir(), { recursive: true });
 }
 
-async function addStreamBlock({ port, containerName, internalPort, tlsEnabled = false, type = 'nosql' }) {
+async function addGatewayMap({ host, containerName, internalPort = 27017 }) {
   ensureStreamDir();
+  await fs.promises.writeFile(
+    gatewayMapPath(host),
+    `${String(host).toLowerCase()} ${containerName}:${internalPort};\n`,
+    'utf8',
+  );
+}
+
+async function addStreamBlock({ port, host, containerName, internalPort, tlsEnabled = false, type = 'nosql', routing = 'nginx' }) {
+  ensureStreamDir();
+  if (routing === 'mongo-gateway') {
+    await addGatewayMap({ host, containerName, internalPort });
+    return;
+  }
   await fs.promises.writeFile(configPath(port), blockText({ port, containerName, internalPort, tlsEnabled, type }), 'utf8');
 }
 
-async function removeStreamBlock(port) {
+async function removeStreamBlock(port, host) {
   await fs.promises.unlink(configPath(port)).catch((err) => {
     if (err.code !== 'ENOENT') throw err;
   });
+  if (host) {
+    await fs.promises.unlink(gatewayMapPath(host)).catch((err) => {
+      if (err.code !== 'ENOENT') throw err;
+    });
+  }
 }
 
 // Best-effort reload. This exec path only works when the nginx container
@@ -93,19 +121,31 @@ async function syncFromDatabaseRows(rows) {
       await fs.promises.unlink(path.join(streamDir(), f)).catch(() => {});
     }
   }
-  for (const r of rows) {
-    if (r.routing !== 'nginx' || !r.containerName) continue;
-    const internalPort = r.type === 'nosql' ? 27017 : 5432;
-    await addStreamBlock({ port: r.port, containerName: r.containerName, internalPort, tlsEnabled: !!r.tlsEnabled, type: r.type });
+  const gatewayEntries = await fs.promises.readdir(gatewayMapDir()).catch(() => []);
+  for (const f of gatewayEntries) {
+    if (f.endsWith('.map')) {
+      await fs.promises.unlink(path.join(gatewayMapDir(), f)).catch(() => {});
+    }
   }
-  return rows.filter((r) => r.routing === 'nginx').length;
+  for (const r of rows) {
+    if (!r.containerName) continue;
+    const internalPort = r.type === 'nosql' ? 27017 : 5432;
+    if (r.routing === 'mongo-gateway') {
+      await addGatewayMap({ host: r.host, containerName: r.containerName, internalPort });
+    } else if (r.routing === 'nginx') {
+      await addStreamBlock({ port: r.port, containerName: r.containerName, internalPort, tlsEnabled: !!r.tlsEnabled, type: r.type });
+    }
+  }
+  return rows.filter((r) => r.routing === 'nginx' || r.routing === 'mongo-gateway').length;
 }
 
 module.exports = {
   addStreamBlock,
   removeStreamBlock,
+  addGatewayMap,
   reloadNginx,
   syncFromDatabaseRows,
   configPath,
   streamDir,
+  gatewayMapPath,
 };

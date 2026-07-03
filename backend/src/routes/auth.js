@@ -467,11 +467,11 @@ router.delete('/me', requireAuth, async (req, res, next) => {
       const { containerName, dataDir } = resolveNames(db);
       try { await stopAndRemoveContainer(containerName); } catch (e) { console.error('[delete-account] container:', e.message); }
       try { await removeDataDir(dataDir); } catch (e) { console.error('[delete-account] data dir:', e.message); }
-      if (db.routing === 'nginx') {
-        try { await removeStreamBlock(db.port); } catch (e) { console.error('[delete-account] nginx:', e.message); }
+      if (db.routing === 'nginx' || db.routing === 'mongo-gateway') {
+        try { await removeStreamBlock(db.port, db.host); } catch (e) { console.error('[delete-account] nginx:', e.message); }
       }
     }
-    if (dbs.some((d) => d.routing === 'nginx')) {
+    if (dbs.some((d) => d.routing === 'nginx' || d.routing === 'mongo-gateway')) {
       await reloadNginx().catch(() => {});
     }
 

@@ -120,7 +120,7 @@ function buildHostConfig({ internalPort, port, bindPath, routing, extraBinds = [
 }
 
 function buildNetworkingConfig(routing) {
-  if (routing === 'nginx') {
+  if (routing === 'nginx' || routing === 'mongo-gateway') {
     return { EndpointsConfig: { [networkName()]: {} } };
   }
   return undefined;

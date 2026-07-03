@@ -86,7 +86,7 @@ model Database {
   userId          String         @db.Uuid
   dbName          String
   type            DatabaseType
-  port            Int            @unique
+  port            Int
   host            String
   status          DatabaseStatus @default(provisioning)
   storageUsed     BigInt         @default(0)

@@ -145,7 +145,7 @@ async function bootstrap() {
     // customer database routing immediately. It doesn't depend on per-DB
     // container reconciliation.
     const n = await syncFromDatabaseRows(rows.map((r) => ({
-      port: r.port, type: r.type, routing: r.routing, containerName: r.containerName, tlsEnabled: r.tlsEnabled,
+      port: r.port, host: r.host, type: r.type, routing: r.routing, containerName: r.containerName, tlsEnabled: r.tlsEnabled,
     })));
     if (n > 0) await reloadNginx().catch(() => {});
     console.log(`[bootstrap] synced ${n} nginx stream blocks`);

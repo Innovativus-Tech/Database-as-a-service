@@ -3,8 +3,9 @@
 # Notes:
 #  - The backend mounts /var/run/docker.sock so Dockerode can provision user DB containers.
 #  - User DB containers are created on the customdb-network (external, see bottom).
-#  - Nginx listens on a wide port range (27018-27999 + 5433-5999) and proxies by container
-#    name to the user DBs on customdb-network.
+#  - Nginx exposes a shared Mongo gateway port (27017), keeps a legacy Mongo
+#    range (27018-27117), and exposes a Postgres range (5433-5532). It proxies
+#    by hostname/port to user DBs on customdb-network.
 #  - The meta DB and per-user data volumes are stored under ./var on the host.
 
 services:
@@ -89,6 +90,9 @@ services:
       REDIS_URL: redis://default:${REDIS_PASSWORD}@redis:6379
       REDIS_PUBLIC_HOST: ${VPS_HOST}
       REDIS_PUBLIC_PORT: 6380
+      MONGO_GATEWAY_ENABLED: ${MONGO_GATEWAY_ENABLED:-true}
+      MONGO_GATEWAY_DOMAIN: ${MONGO_GATEWAY_DOMAIN:-}
+      MONGO_GATEWAY_PORT: ${MONGO_GATEWAY_PORT:-27017}
       # Optional per-user caps. Empty = unlimited (internal deployment).
       DB_LIMIT: ${DB_LIMIT:-}
       STORAGE_LIMIT_GB: ${STORAGE_LIMIT_GB:-}
@@ -205,8 +209,12 @@ services:
     volumes:
       - ./nginx/stream.d:/etc/nginx/stream.d
     ports:
+      # Shared Mongo gateway port. New Mongo databases use unique hostnames
+      # under MONGO_GATEWAY_DOMAIN instead of consuming one public port each.
+      - "27017:27017"
       # MongoDB port range (100 ports). Wider ranges cause docker-compose to
       # spend minutes setting up iptables rules per port and Coolify times out.
+      # Kept for legacy Mongo databases created before gateway routing.
       - "27018-27117:27018-27117"
       # PostgreSQL port range (100 ports).
       - "5433-5532:5433-5532"

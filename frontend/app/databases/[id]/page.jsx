@@ -175,6 +175,7 @@ export default function DatabaseDetailPage() {
     : standardUrl.replace(/^postgresql:\/\//, 'customdb-pg://');
   const url = urlFormat === 'sdk' ? sdkUrl : standardUrl;
   const maskedUrl = url.replace(`:${encodeURIComponent(cred.password)}@`, ':••••••@');
+  const maskedStandardUrl = standardUrl.replace(`:${encodeURIComponent(cred.password)}@`, ':••••••@');
   const Icon = isMongo ? Leaf : Database;
   const iconColor = isMongo ? 'text-mongo' : 'text-postgres';
 
@@ -289,6 +290,31 @@ export default function DatabaseDetailPage() {
                   )}
                 </div>
               </div>
+
+              {urlFormat === 'sdk' && (
+                <div className="bg-[#111111] border border-border rounded-lg p-5">
+                  <div className="flex items-center justify-between mb-3">
+                    <div>
+                      <div className="text-sm font-medium">Standard database URL</div>
+                      <div className="mt-1 text-xs text-text-muted">
+                        {isMongo ? 'Use this for MongoDB Compass, mongosh, and normal MongoDB drivers.' : 'Use this for psql and normal PostgreSQL drivers.'}
+                      </div>
+                    </div>
+                    <span className="rounded bg-bg-inset px-2 py-0.5 font-mono text-xs text-text-secondary">
+                      {isMongo ? 'mongodb://' : 'postgresql://'}
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-3 bg-[#0d0d0d] border border-border rounded-lg p-3">
+                    <span className="flex-1 font-mono text-sm text-text-primary break-all">
+                      {showPassword ? standardUrl : maskedStandardUrl}
+                    </span>
+                    <CopyButton value={standardUrl} />
+                  </div>
+                  <div className="text-xs text-text-muted mt-2.5">
+                    Share this URL with trusted users who need direct database access. The SDK URL above is only for <code className="font-mono text-text-secondary">@customdb/client</code>.
+                  </div>
+                </div>
+              )}
 
               {/* Redis cache link card — the second half of the connection
                   pipeline: same creds pattern, scoped to this DB's key prefix. */}
