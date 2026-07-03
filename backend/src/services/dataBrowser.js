@@ -45,6 +45,10 @@ function getPgPool(connectionUrl) {
     connectionTimeoutMillis: 5000,
     idleTimeoutMillis: 60_000, // recycle idle conns after a minute
     max: 5,                    // cap per-user-DB connections from this process
+    // Hard ceiling on any single dashboard query against a user DB. On a
+    // multi-GB table a runaway COUNT/SELECT would otherwise hold the
+    // connection (and the user's browser) hostage indefinitely.
+    options: '-c statement_timeout=15000',
   });
   pool.on('error', (err) => {
     console.warn('[pg pool] background error for', connectionUrl.replace(/:[^:@/]+@/, ':***@'), '-', err.code || err.message);
@@ -130,11 +134,22 @@ async function browseMongoCollection({ connectionUrl, dbName, collection, skip =
   return withMongo(connectionUrl, async (client) => {
     const col = client.db(dbName).collection(collection);
     const query = coerceMongoFilterIds(filter);
-    const [rows, total] = await Promise.all([
-      col.find(query).skip(skip).limit(limit).toArray(),
-      col.countDocuments(query),
-    ]);
-    return { total, skip, limit, rows };
+    const hasFilter = query && Object.keys(query).length > 0;
+
+    // Heavy-collection safety: an unfiltered browse uses the O(1) metadata
+    // count instead of scanning; a filtered count is capped in both time and
+    // documents so a 100M-doc collection can't wedge the request. If the
+    // count still can't finish, fall back to "at least this many" so
+    // pagination keeps working.
+    const findP = col.find(query).maxTimeMS(15_000).skip(skip).limit(limit).toArray();
+    const countP = hasFilter
+      ? col.countDocuments(query, { maxTimeMS: 5_000, limit: 1_000_000 }).catch(() => null)
+      : col.estimatedDocumentCount().catch(() => null);
+    let [rows, total] = await Promise.all([findP, countP]);
+
+    let totalEstimated = !hasFilter || total === null || total >= 1_000_000;
+    if (total === null) total = skip + rows.length + (rows.length === limit ? 1 : 0);
+    return { total, totalEstimated, skip, limit, rows };
   });
 }
 
@@ -251,14 +266,22 @@ async function listPostgresTables({ connectionUrl, schema = 'public' }) {
       ORDER BY c.relname;`;
     const { rows } = await client.query(sql, [schema]);
 
-    // reltuples is -1 until ANALYZE runs. For freshly-imported tables that's
-    // almost always the case, so fall back to a real COUNT(*) per table.
+    // reltuples is -1 until ANALYZE runs (CSV imports now ANALYZE right
+    // after loading, so this is the exception). The fallback count is capped
+    // at 50k scanned rows so one giant never-analyzed table can't stall the
+    // whole sidebar listing.
     const out = [];
     for (const r of rows) {
       let count = Number(r.estimated_count);
       if (count < 0) {
-        const exact = await client.query(`SELECT COUNT(*)::bigint AS c FROM ${qualify(schema, r.name)}`);
-        count = Number(exact.rows[0].c);
+        try {
+          const capped = await client.query(
+            `SELECT COUNT(*)::bigint AS c FROM (SELECT 1 FROM ${qualify(schema, r.name)} LIMIT 50001) s`
+          );
+          count = Number(capped.rows[0].c);
+        } catch {
+          count = 0;
+        }
       }
       out.push({ name: r.name, count });
     }
@@ -282,8 +305,33 @@ async function browsePostgresTable({ connectionUrl, schema = 'public', table, sk
     }
     const columns = colsRes.rows.map((r) => r.column_name);
 
-    const countRes = await client.query(`SELECT COUNT(*)::bigint AS c FROM ${qualify(schema, table)}`);
-    const total = Number(countRes.rows[0].c);
+    // Heavy-table safety: COUNT(*) is a full scan — on a 50M-row table that's
+    // seconds-to-minutes for every page view. Use the planner's estimate for
+    // big tables (same thing Atlas/pgAdmin show) and only exact-count small
+    // ones. If the exact count still times out (statement_timeout), fall back
+    // to the estimate rather than erroring the whole browse request.
+    const estRes = await client.query(
+      `SELECT c.reltuples::bigint AS est
+         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = $1 AND c.relname = $2`,
+      [schema, table]
+    );
+    const est = Number(estRes.rows[0]?.est ?? -1);
+
+    let total;
+    let totalEstimated = false;
+    if (est >= 50_000) {
+      total = est;
+      totalEstimated = true;
+    } else {
+      try {
+        const countRes = await client.query(`SELECT COUNT(*)::bigint AS c FROM ${qualify(schema, table)}`);
+        total = Number(countRes.rows[0].c);
+      } catch {
+        total = Math.max(est, 0);
+        totalEstimated = true;
+      }
+    }
 
     // ctid (physical row id) lets the client edit/delete a specific row even
     // though most tables here have no declared primary key. It's only stable
@@ -292,7 +340,10 @@ async function browsePostgresTable({ connectionUrl, schema = 'public', table, sk
       `SELECT *, ctid::text AS "__ctid" FROM ${qualify(schema, table)} LIMIT $1 OFFSET $2`,
       [Math.min(limit, 500), skip]
     );
-    return { total, skip, limit, columns, rows: rowsRes.rows };
+    // The estimate can lag reality — never show a total smaller than what
+    // the user is literally looking at.
+    total = Math.max(total, skip + rowsRes.rows.length);
+    return { total, totalEstimated, skip, limit, columns, rows: rowsRes.rows };
   });
 }
 

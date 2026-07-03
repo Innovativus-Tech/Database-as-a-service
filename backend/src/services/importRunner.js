@@ -8,6 +8,14 @@ function runImport(args, onProgress) {
   return new Promise((resolve, reject) => {
     const worker = new Worker(path.join(__dirname, 'importWorker.js'), {
       workerData: args,
+      // Heap ceiling for the import itself. Without this, a pathological
+      // file could balloon the worker until the kernel OOM-kills the WHOLE
+      // backend container (taking every user's dashboard session with it).
+      // With it, only the worker dies and the job reports a clean error.
+      resourceLimits: {
+        maxOldGenerationSizeMb: 1536,
+        maxYoungGenerationSizeMb: 128,
+      },
     });
 
     let settled = false;

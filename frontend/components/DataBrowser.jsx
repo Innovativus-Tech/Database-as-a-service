@@ -119,8 +119,14 @@ export default function DataBrowser({ databaseId, dbType }) {
     );
   }
 
-  const total = data?.total ?? 0;
-  const showing = data ? `${data.skip + 1}–${Math.min(data.skip + data.rows.length, total)} of ${total}` : '';
+  // total can be an estimate on large collections (the backend avoids full
+  // scans there) — never show a total smaller than the rows on screen, and
+  // flag estimates with "~".
+  const total = data ? Math.max(data.total ?? 0, data.skip + data.rows.length) : 0;
+  const totalLabel = data?.totalEstimated ? `~${total.toLocaleString()}` : total.toLocaleString();
+  const showing = data && data.rows.length > 0
+    ? `${(data.skip + 1).toLocaleString()}–${(data.skip + data.rows.length).toLocaleString()} of ${totalLabel}`
+    : '';
   const canPrev = skip > 0;
   const canNext = data && skip + data.rows.length < total;
 

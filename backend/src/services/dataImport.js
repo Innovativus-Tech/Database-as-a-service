@@ -52,6 +52,19 @@ function csvRecordStream(filePath) {
 // JSON → MongoDB
 // ──────────────────────────────────────────────────────────────────────────────
 async function importJsonToMongo({ connectionUrl, dbName, collection, filePath, onProgress }) {
+  // .json is the one format we must parse as a single in-memory blob
+  // (JSON.parse). Past ~100 MB the string + parsed object graph can blow the
+  // worker's heap. CSV and mongodump imports stream, so they carry the
+  // full 200 MB budget — point big datasets at those instead of failing
+  // opaquely with an OOM.
+  const { size } = await fs.promises.stat(filePath);
+  const MAX_JSON_BYTES = 100 * 1024 * 1024;
+  if (size > MAX_JSON_BYTES) {
+    throw Object.assign(
+      new Error('.json imports are limited to 100 MB (the file must be parsed in memory). For larger datasets use .csv or a mongodump .zip — both stream.'),
+      { status: 400 }
+    );
+  }
   const raw = await fs.promises.readFile(filePath, 'utf8');
   let parsed;
   try { parsed = JSON.parse(raw); }
@@ -174,6 +187,10 @@ async function importCsvToPostgres({ connectionUrl, table, filePath, onProgress 
     }
     await flush();
     if (!columns) return { count: 0, target: table };
+    // Refresh planner stats immediately — the dashboard's table listing and
+    // pagination totals read reltuples, which stays -1 (triggering fallback
+    // scans) until the first ANALYZE.
+    await client.query(`ANALYZE "${table}"`).catch(() => {});
     onProgress?.(inserted, totalEstimate || inserted || null);
     return { count: inserted, target: table };
   } finally {
