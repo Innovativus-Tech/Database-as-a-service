@@ -64,15 +64,18 @@ async function removeStreamBlock(port) {
   });
 }
 
-// Best-effort reload — succeeds silently if nginx isn't running locally.
+// Best-effort reload. This exec path only works when the nginx container
+// keeps its compose container_name (plain docker compose). Orchestrators
+// like Coolify generate their own names, so the exec misses — that's fine:
+// the nginx image runs an inotify watcher (nginx/reload-watcher.sh) that
+// reloads itself whenever a stream config changes, so routing still updates.
 async function reloadNginx() {
   try {
     const { stderr } = await execFileP('docker', ['exec', nginxContainer(), 'nginx', '-s', 'reload']);
     return { reloaded: true, stderr };
   } catch (err) {
-    // If the container doesn't exist (Phase 7 dev without nginx running yet), that's OK.
     if (/No such container/i.test(err.stderr || err.message)) {
-      console.warn(`[nginx] container ${nginxContainer()} not running; config written but not reloaded`);
+      console.log(`[nginx] no container named ${nginxContainer()} (orchestrator-managed names?) — relying on nginx's in-container config watcher`);
       return { reloaded: false, reason: 'no-nginx-container' };
     }
     throw err;

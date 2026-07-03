@@ -31,6 +31,13 @@ services:
       POSTGRES_DB: customdb_meta
     volumes:
       - meta-db-data:/var/lib/postgresql/data
+    # Must share a network with the backend for `meta-db` DNS to resolve.
+    # The backend opts out of the compose `default` network (it declares its
+    # own list), so without this line the two only see each other on
+    # orchestrators that inject a shared network (Coolify) — plain
+    # `docker compose up` would fail.
+    networks:
+      - customdb-network
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U customdb -d customdb_meta"]
@@ -73,10 +80,13 @@ services:
       CUSTOMDB_NETWORK: customdb-network
       NGINX_CONTAINER: customdb-nginx
       NGINX_STREAM_DIR: /etc/nginx/stream.d
-      # Internal Redis URL — backend talks to redis container on the
-      # customdb-network. Customer-facing host (for SDK use) is the public
-      # VPS host on the external port (6380).
-      REDIS_URL: redis://default:${REDIS_PASSWORD}@customdb-redis:6379
+      # Internal Redis URL — backend talks to redis via its SERVICE name.
+      # Do NOT use the container_name here: Coolify (and other orchestrators)
+      # override container_name with generated names, so `customdb-redis`
+      # doesn't resolve there — the service name `redis` always does (same
+      # reason DATABASE_URL uses `meta-db`). Customer-facing host (for SDK
+      # use) is the public VPS host on the external port (6380).
+      REDIS_URL: redis://default:${REDIS_PASSWORD}@redis:6379
       REDIS_PUBLIC_HOST: ${VPS_HOST}
       REDIS_PUBLIC_PORT: 6380
       # Optional per-user caps. Empty = unlimited (internal deployment).
