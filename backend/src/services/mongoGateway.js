@@ -10,7 +10,7 @@
 // Requires a wildcard DNS record: *.<gateway domain> → VPS IP
 // (default gateway domain is mongo.<VPS_HOST>).
 
-const { randomToken } = require('./crypto');
+const crypto = require('crypto');
 
 function mongoGatewayEnabled() {
   return process.env.MONGO_GATEWAY_ENABLED !== 'false';
@@ -28,8 +28,10 @@ function mongoGatewayPort() {
 }
 
 // Mint a fresh unique gateway hostname for a new (or migrated) database.
+// Hex, not base64url: base64url's alphabet includes "_" which is not valid
+// in a hostname label (drivers and resolvers can reject it).
 function mongoGatewayHost() {
-  return `m-${randomToken(8).toLowerCase()}.${mongoGatewayDomain()}`;
+  return `m-${crypto.randomBytes(8).toString('hex')}.${mongoGatewayDomain()}`;
 }
 
 function isNetworkRouted(db) {

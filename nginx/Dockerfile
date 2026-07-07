@@ -28,7 +28,8 @@ RUN mkdir -p /etc/nginx/tls && \
 # entries live in a child dir so the top-level include only sees server blocks.
 RUN mkdir -p /etc/nginx/stream.d/mongo-gateway
 
-EXPOSE 27017 27018-27999 5433-5999
+# One shared Mongo port (TLS SNI routing) — the only data port nginx serves.
+EXPOSE 27017
 # Watcher runs in the background; exec keeps nginx as the main process so it
 # still receives container stop signals directly.
 CMD ["/bin/sh", "-c", "/reload-watcher.sh & exec nginx -g 'daemon off;'"]
