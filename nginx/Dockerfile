@@ -27,7 +27,8 @@ RUN mkdir -p /etc/nginx/tls && \
 # Stream blocks live in this dir and are included from nginx.conf.
 RUN mkdir -p /etc/nginx/stream.d
 
-EXPOSE 27018-27999 5433-5999
+# One shared Mongo port (TLS SNI routing) — see stream.d/customdb-sni.conf.
+EXPOSE 27017
 # Watcher runs in the background; exec keeps nginx as the main process so it
 # still receives container stop signals directly.
 CMD ["/bin/sh", "-c", "/reload-watcher.sh & exec nginx -g 'daemon off;'"]

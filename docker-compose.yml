@@ -3,9 +3,10 @@
 # Notes:
 #  - The backend mounts /var/run/docker.sock so Dockerode can provision user DB containers.
 #  - User DB containers are created on the customdb-network (external, see bottom).
-#  - Nginx listens on a wide port range (27018-27999 + 5433-5999) and proxies by container
-#    name to the user DBs on customdb-network.
-#  - The meta DB and per-user data volumes are stored under ./var on the host.
+#  - Single-port data plane: nginx serves ALL Mongo databases on one port
+#    (TLS SNI routing, needs wildcard DNS *.mongo.<VPS_HOST>); the backend's
+#    pgGateway serves ALL Postgres databases on one port (routes by username).
+#  - The meta DB and per-user data volumes are stored under /data on the host.
 
 services:
   # The two platform services below (meta-db + backend) are CRITICAL —
@@ -89,6 +90,12 @@ services:
       REDIS_URL: redis://default:${REDIS_PASSWORD}@redis:6379
       REDIS_PUBLIC_HOST: ${VPS_HOST}
       REDIS_PUBLIC_PORT: 6380
+      # Single-port routing. These are the PUBLIC ports baked into every
+      # connection string — they must match the port mappings below (nginx
+      # for Mongo, this container for Postgres). Defaults reuse the first
+      # ports of the old published ranges so upgrades can't collide.
+      MONGO_PUBLIC_PORT: ${MONGO_PUBLIC_PORT:-27018}
+      PG_PUBLIC_PORT: ${PG_PUBLIC_PORT:-5433}
       # Optional per-user caps. Empty = unlimited (internal deployment).
       DB_LIMIT: ${DB_LIMIT:-}
       STORAGE_LIMIT_GB: ${STORAGE_LIMIT_GB:-}
@@ -103,6 +110,10 @@ services:
       # of them, queueing bcrypt.compare from concurrent login attempts.
       # 16 leaves plenty of headroom for auth even mid-cleanup.
       UV_THREADPOOL_SIZE: 16
+    ports:
+      # ALL Postgres databases share this one public port — the backend's
+      # pgGateway routes by username to the right container (see pgGateway.js).
+      - "${PG_PUBLIC_PORT:-5433}:5432"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       # Mount host /data so the path is identical inside the backend AND when
@@ -196,11 +207,11 @@ services:
     volumes:
       - ./nginx/stream.d:/etc/nginx/stream.d
     ports:
-      # MongoDB port range (100 ports). Wider ranges cause docker-compose to
-      # spend minutes setting up iptables rules per port and Coolify times out.
-      - "27018-27117:27018-27117"
-      # PostgreSQL port range (100 ports).
-      - "5433-5532:5433-5532"
+      # ALL Mongo databases share this one public port. nginx terminates TLS
+      # and routes by SNI hostname (<db>-<id8>.mongo.<VPS_HOST>) to the right
+      # container — no more one-port-per-database ranges. Requires a wildcard
+      # DNS record: *.mongo.<VPS_HOST> -> this host.
+      - "${MONGO_PUBLIC_PORT:-27018}:27017"
     networks: [customdb-network]
     restart: unless-stopped
     healthcheck:

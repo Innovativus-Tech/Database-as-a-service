@@ -130,7 +130,7 @@ async function reprovisionAllRedisAcls() {
 
 async function bootstrap() {
   const { ensureNetwork } = require('./services/dockerNetwork');
-  const { syncFromDatabaseRows, reloadNginx } = require('./services/nginxManager');
+  const { syncMongoSni, reloadNginx } = require('./services/nginxManager');
   const { ensureContainerRunning } = require('./services/provisioning');
   const { decrypt } = require('./services/crypto');
   try {
@@ -141,14 +141,12 @@ async function bootstrap() {
       include: { credentials: true },
     });
 
-    // Write nginx stream configs first — this is the fast part and unblocks
-    // customer database routing immediately. It doesn't depend on per-DB
-    // container reconciliation.
-    const n = await syncFromDatabaseRows(rows.map((r) => ({
-      port: r.port, type: r.type, routing: r.routing, containerName: r.containerName, tlsEnabled: r.tlsEnabled,
-    })));
-    if (n > 0) await reloadNginx().catch(() => {});
-    console.log(`[bootstrap] synced ${n} nginx stream blocks`);
+    // Write the single-port SNI routing config first — this is the fast part
+    // and unblocks customer database routing immediately. It doesn't depend
+    // on per-DB container reconciliation.
+    const n = await syncMongoSni(rows);
+    await reloadNginx().catch(() => {});
+    console.log(`[bootstrap] synced ${n} Mongo SNI routes`);
 
     // Reconciling user-DB containers is SLOW (docker inspect per DB, and
     // recreating any that vanished can take seconds each). Don't block
@@ -187,6 +185,13 @@ async function bootstrap() {
 const PORT = Number(process.env.PORT) || 4000;
 const server = app.listen(PORT, async () => {
   console.log(`[customdb-backend] listening on http://localhost:${PORT}`);
+
+  // Single-port Postgres routing (Mongo's equivalent lives in nginx via SNI).
+  // Listens on a fixed internal port; compose maps ${PG_PUBLIC_PORT} to it.
+  const { startPgGateway } = require('./services/pgGateway');
+  startPgGateway({ port: Number(process.env.PG_GATEWAY_LISTEN_PORT) || 5432 })
+    .catch((err) => console.error('[pg-gateway] failed to start:', err.message));
+
   await bootstrap();
 });
 

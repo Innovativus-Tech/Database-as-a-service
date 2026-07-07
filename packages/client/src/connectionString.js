@@ -71,9 +71,13 @@ function parse(connectionString) {
 }
 
 function guessCacheConfigUrl(host) {
-  // Heuristic: dbaas.innovativus.tech → https://api.dbaas.innovativus.tech
-  // Works for the standard CustomDB convention. If the customer has set
-  // up a different topology, they pass { cacheConfigUrl } to the client.
+  // Heuristics for the standard CustomDB topologies. If the customer has set
+  // up something different, they pass { cacheConfigUrl } to the client.
+  //
+  // Single-port Mongo hosts look like <db>-<id8>.mongo.<root domain> — the
+  // API lives at api.<root domain>, so strip everything through ".mongo.".
+  const sniMarker = host.indexOf('.mongo.');
+  if (sniMarker >= 0) return `https://api.${host.slice(sniMarker + '.mongo.'.length)}`;
   if (host.startsWith('api.')) return `https://${host}`;
   if (host.startsWith('dbaas.')) return `https://api.${host}`;
   // Fallback: assume the API is at api.<host>. Customer can override.

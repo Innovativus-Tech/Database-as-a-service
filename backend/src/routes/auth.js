@@ -11,7 +11,7 @@ const {
   removeDataDir,
   resolveNames,
 } = require('../services/provisioning');
-const { removeStreamBlock, reloadNginx } = require('../services/nginxManager');
+const { syncMongoSni, reloadNginx } = require('../services/nginxManager');
 
 const router = express.Router();
 
@@ -467,15 +467,17 @@ router.delete('/me', requireAuth, async (req, res, next) => {
       const { containerName, dataDir } = resolveNames(db);
       try { await stopAndRemoveContainer(containerName); } catch (e) { console.error('[delete-account] container:', e.message); }
       try { await removeDataDir(dataDir); } catch (e) { console.error('[delete-account] data dir:', e.message); }
-      if (db.routing === 'nginx') {
-        try { await removeStreamBlock(db.port); } catch (e) { console.error('[delete-account] nginx:', e.message); }
-      }
-    }
-    if (dbs.some((d) => d.routing === 'nginx')) {
-      await reloadNginx().catch(() => {});
     }
 
     await prisma.user.delete({ where: { id: req.user.id } });
+
+    // Rebuild the single-port routing table without this user's databases.
+    try {
+      const remaining = await prisma.database.findMany({ where: { status: { not: 'deleted' } } });
+      await syncMongoSni(remaining);
+      await reloadNginx().catch(() => {});
+    } catch (e) { console.error('[delete-account] nginx resync:', e.message); }
+
     res.json({ ok: true });
   } catch (err) {
     next(err);

@@ -12,25 +12,34 @@ user are unlimited unless you explicitly set `DB_LIMIT` / `STORAGE_LIMIT_GB`.
 ## Architecture
 
 ```
-                        ┌──────────────────────────── VPS / Docker host ─┐
-  browser ── https ──▶  │ frontend (Next.js :3030)                       │
-                        │ backend  (Express :4000)──── docker.sock       │
-  mongosh/driver ─────▶ │ nginx TCP proxy (:27018-27117, :5433-5532)     │
-    mongodb://…:27018   │   ├─ customdb-mongo-<user>-<db>   (mongo:7)    │
-    postgresql://…:5433 │   ├─ customdb-pg-<user>-<db>      (postgres:16)│
-                        │   └─ … one container per database              │
-  redis cache ────────▶ │ redis (:6380, per-DB ACL users)                │
-                        │ meta-db (postgres:16, platform metadata)       │
-                        └────────────────────────────────────────────────┘
+                          ┌────────────────────────── VPS / Docker host ─┐
+  browser ── https ────▶  │ frontend (Next.js :3030)                     │
+                          │ backend  (Express :4000)──── docker.sock     │
+  ALL mongo DBs, 1 port ▶ │ nginx TLS-SNI router (:27018)                │
+   <db>-<id>.mongo.HOST   │   ├─ customdb-mongo-<user>-<db>  (mongo:7)   │
+  ALL pg DBs, 1 port ───▶ │ backend pgGateway (:5433)                    │
+   postgres://…HOST:5433  │   ├─ customdb-pg-<user>-<db>   (postgres:16) │
+                          │   └─ … one container per database            │
+  redis cache ──────────▶ │ redis (:6380, per-DB ACL users)              │
+                          │ meta-db (postgres:16, platform metadata)     │
+                          └──────────────────────────────────────────────┘
 ```
 
 - **backend** provisions one Docker container per user database (via the
-  mounted Docker socket), writes an nginx `stream {}` block per database, and
-  hands out connection strings.
-- **nginx** proxies each public port to the right container by name. Mongo
-  traffic is TLS-terminated at nginx (self-signed cert); Postgres does its own
-  TLS inside the container (STARTTLS-style handshake can't terminate at a TCP
-  proxy).
+  mounted Docker socket), maintains the single-port routing tables, and hands
+  out connection strings.
+- **Single-port data plane** — no per-database port ranges on the host:
+  - *Mongo*: every database gets a unique hostname
+    (`<db>-<id8>.mongo.<VPS_HOST>`) resolving to the same IP; nginx terminates
+    TLS on ONE shared port (`MONGO_PUBLIC_PORT`, default 27018) and routes by
+    SNI to the right container — the same design as Atlas's
+    `cluster0.xxxxx.mongodb.net`. **Requires a wildcard DNS record
+    `*.mongo.<VPS_HOST>` → VPS IP.**
+  - *Postgres*: PG's STARTTLS-style handshake carries no SNI, so the backend
+    runs a small protocol-aware gateway on ONE shared port (`PG_PUBLIC_PORT`,
+    default 5433) that reads the startup message's username (globally unique
+    per database) and pipes the connection to the right container. Auth still
+    happens end-to-end against the real Postgres.
 - **redis** provides per-database cache users: each database gets an ACL user
   restricted to keys under `cdb:<dbId>:*`, with credentials derived
   deterministically from the platform secret (nothing stored). ACLs are
@@ -54,8 +63,11 @@ docker compose -f docker-compose.yml -f docker-compose.local.yml up --build
 - Create a database in the dashboard → you get a connection string like:
 
 ```
-mongodb://cdb_xxxx:PASSWORD@localhost:27018/mydb?authSource=admin&tls=true&tlsAllowInvalidCertificates=true
+mongodb://cdb_xxxx:PASSWORD@mydb-3f9a2b1c.mongo.localhost:27018/mydb?authSource=admin&tls=true&tlsAllowInvalidCertificates=true
 ```
+
+(`*.localhost` names resolve to 127.0.0.1 on modern systems, so SNI routing
+works locally without DNS setup.)
 
 Test it exactly like an Atlas string:
 
@@ -78,8 +90,11 @@ On a non-Coolify host, deploy with the local override or replace the `coolify`
 network with your own reverse-proxy network.
 
 1. **DNS** — point your dashboard domain (e.g. `dbaas.example.com`) and API
-   domain (e.g. `api.dbaas.example.com`) at the host. Database connection
-   strings use `VPS_HOST` verbatim, so that name must resolve publicly.
+   domain (e.g. `api.dbaas.example.com`) at the host, **plus a wildcard
+   record `*.mongo.<VPS_HOST>` → VPS IP** (e.g. `*.mongo.dbaas.example.com`)
+   — Mongo's single-port SNI routing hands out a unique hostname per
+   database under that wildcard. Postgres connection strings use `VPS_HOST`
+   verbatim, so that name must resolve publicly too.
 2. **Environment** — copy `.env.example` → `.env` and set real values:
 
    | Variable | Purpose |
@@ -94,14 +109,16 @@ network with your own reverse-proxy network.
    | `SMTP_URL` or `SMTP_HOST/PORT/USER/PASS` | Password-reset email. If unset, reset links are printed to backend logs. |
    | `DB_LIMIT`, `STORAGE_LIMIT_GB` | **Optional caps. Empty = unlimited (default).** |
 
-3. **Ports** — open `3030` (or your proxy), the API route, `27018-27117`
-   (Mongo), `5433-5532` (Postgres), `6380` (Redis) in the firewall. Widen the
-   port ranges via `NOSQL_PORT_MIN/MAX`, `SQL_PORT_MIN/MAX` — keep them in
-   sync with the nginx `ports:` ranges in `docker-compose.yml` (each range
-   currently allows 100 databases of that type).
+3. **Ports** — only four data-plane ports total, regardless of how many
+   databases exist: `3030` (or your proxy) for the dashboard, the API route,
+   `MONGO_PUBLIC_PORT` (default `27018`) for ALL Mongo databases,
+   `PG_PUBLIC_PORT` (default `5433`) for ALL Postgres databases, and `6380`
+   (Redis). Capacity per type is bounded by the internal port-bookkeeping
+   ranges (`NOSQL_PORT_MIN/MAX`, `SQL_PORT_MIN/MAX`, 100 each by default) —
+   widening those needs no firewall or compose changes anymore.
 4. **Deploy** — `docker compose up -d --build`. The backend runs
    `prisma migrate deploy` on start, reconciles user containers, rewrites
-   nginx stream configs, and re-provisions Redis ACLs.
+   the SNI routing map, and re-provisions Redis ACLs.
 5. **Backups** — user data lives under `/data/<user>-<db>` on the host, the
    platform metadata in the `meta-db-data` volume. Snapshot both. (Per-DB
    dumps: `docker exec customdb-mongo-… mongodump`, or use the dashboard's
