@@ -128,25 +128,57 @@ async function reprovisionAllRedisAcls() {
   return dbs.length;
 }
 
+// One-time upgrade of Mongo rows created before shared-port gateway routing:
+// they were reachable through per-database published ports, and those port
+// ranges are no longer published. Mint each one a gateway hostname and flip
+// its routing so it's served through the shared port like every new database.
+// Old connection strings for these rows stop working — the dashboard shows
+// the new one. Idempotent: already-migrated rows don't match the filter.
+async function migrateLegacyMongoRows() {
+  const { mongoGatewayEnabled, mongoGatewayHost, mongoGatewayPort } = require('./services/mongoGateway');
+  if (!mongoGatewayEnabled()) return 0;
+  const legacy = await prisma.database.findMany({
+    where: { type: 'nosql', status: { not: 'deleted' }, routing: { not: 'mongo-gateway' } },
+  });
+  for (const db of legacy) {
+    await prisma.database.update({
+      where: { id: db.id },
+      data: {
+        host: mongoGatewayHost(),
+        port: mongoGatewayPort(),
+        routing: 'mongo-gateway',
+        tlsEnabled: true, // the shared gateway listener is TLS-only
+      },
+    });
+    console.log(`[bootstrap] migrated ${db.dbName} (${db.id}) to shared-port gateway routing`);
+  }
+  return legacy.length;
+}
+
 async function bootstrap() {
   const { ensureNetwork } = require('./services/dockerNetwork');
-  const { syncMongoSni, reloadNginx } = require('./services/nginxManager');
+  const { syncFromDatabaseRows, reloadNginx } = require('./services/nginxManager');
   const { ensureContainerRunning } = require('./services/provisioning');
   const { decrypt } = require('./services/crypto');
   try {
     await ensureNetwork();
+
+    await migrateLegacyMongoRows().catch((err) =>
+      console.warn('[bootstrap] legacy mongo migration failed (will retry next boot):', err.message));
 
     const rows = await prisma.database.findMany({
       where: { status: { not: 'deleted' } },
       include: { credentials: true },
     });
 
-    // Write the single-port SNI routing config first — this is the fast part
-    // and unblocks customer database routing immediately. It doesn't depend
-    // on per-DB container reconciliation.
-    const n = await syncMongoSni(rows);
-    await reloadNginx().catch(() => {});
-    console.log(`[bootstrap] synced ${n} Mongo SNI routes`);
+    // Write nginx stream configs first — this is the fast part and unblocks
+    // customer database routing immediately. It doesn't depend on per-DB
+    // container reconciliation.
+    const n = await syncFromDatabaseRows(rows.map((r) => ({
+      port: r.port, host: r.host, type: r.type, routing: r.routing, containerName: r.containerName, tlsEnabled: r.tlsEnabled,
+    })));
+    if (n > 0) await reloadNginx().catch(() => {});
+    console.log(`[bootstrap] synced ${n} nginx stream blocks`);
 
     // Reconciling user-DB containers is SLOW (docker inspect per DB, and
     // recreating any that vanished can take seconds each). Don't block

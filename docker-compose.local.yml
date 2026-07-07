@@ -12,6 +12,7 @@ services:
       NODE_ENV: development
       FRONTEND_ORIGIN: http://localhost:3030
       VPS_HOST: localhost
+      MONGO_GATEWAY_ENABLED: "false"
       NGINX_STREAM_DIR: /etc/nginx/stream.d
       # DATA_ROOT must be a path that is IDENTICAL on the host and inside this
       # container: the backend both writes files there itself (fs) and tells

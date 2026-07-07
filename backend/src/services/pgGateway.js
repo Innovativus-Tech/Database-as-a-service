@@ -271,4 +271,11 @@ async function startPgGateway({ port }) {
   return server;
 }
 
-module.exports = { createPgGateway, startPgGateway };
+// The PUBLIC port customers connect to (host side of the compose mapping).
+// Default reuses the first port of the old published PG range so an upgraded
+// VPS can't collide with anything else.
+function pgPublicPort() {
+  return Number(process.env.PG_PUBLIC_PORT) || 5433;
+}
+
+module.exports = { createPgGateway, startPgGateway, pgPublicPort };

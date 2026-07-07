@@ -47,8 +47,12 @@ function parse(connectionString) {
     throw new Error('Postgres connection string must include /databaseName');
   }
 
-  // The cache-config endpoint lives on the same host as the data plane,
-  // accessible via HTTPS. The convention: dbaas.<rest>:27018 → api.dbaas.<rest>.
+  // The cache-config endpoint lives behind the dashboard/API origin. The
+  // frontend proxies /api/* to the backend, so the public dashboard host is a
+  // valid cache-config base and avoids requiring a separate API subdomain.
+  // Conventions:
+  //   dbaas.<rest>:27018              → dbaas.<rest>
+  //   m-xxxx.mongo.dbaas.<rest>:27017 → dbaas.<rest>
   // If we can't reliably guess, customer can override with cacheConfigUrl option.
   const cacheConfigUrl = guessCacheConfigUrl(url.hostname);
 
@@ -71,17 +75,16 @@ function parse(connectionString) {
 }
 
 function guessCacheConfigUrl(host) {
-  // Heuristics for the standard CustomDB topologies. If the customer has set
-  // up something different, they pass { cacheConfigUrl } to the client.
-  //
-  // Single-port Mongo hosts look like <db>-<id8>.mongo.<root domain> — the
-  // API lives at api.<root domain>, so strip everything through ".mongo.".
-  const sniMarker = host.indexOf('.mongo.');
-  if (sniMarker >= 0) return `https://api.${host.slice(sniMarker + '.mongo.'.length)}`;
+  // Heuristic: dbaas.innovativus.tech → https://dbaas.innovativus.tech
+  //            m-xxxx.mongo.dbaas.innovativus.tech → https://dbaas.innovativus.tech
+  // Works for the standard CustomDB convention. If the customer has set
+  // up a different topology, they pass { cacheConfigUrl } to the client.
+  const mongoGatewayMatch = host.match(/^[^.]+\.mongo\.(.+)$/);
+  if (mongoGatewayMatch) return `https://${mongoGatewayMatch[1]}`;
   if (host.startsWith('api.')) return `https://${host}`;
-  if (host.startsWith('dbaas.')) return `https://api.${host}`;
-  // Fallback: assume the API is at api.<host>. Customer can override.
-  return `https://api.${host}`;
+  if (host.startsWith('dbaas.')) return `https://${host}`;
+  // Fallback: assume the same host serves /api via a proxy. Customer can override.
+  return `https://${host}`;
 }
 
 function buildDriverUrl(engine, url) {

@@ -6,7 +6,7 @@ const multer = require('multer');
 const prisma = require('../prisma');
 const { requireAuth } = require('../middleware/auth');
 const { getNextAvailablePort } = require('../services/portManager');
-const { generateConnectionURL, publicEndpoint } = require('../services/urlGenerator');
+const { generateConnectionURL } = require('../services/urlGenerator');
 const { encrypt, decrypt, randomToken } = require('../services/crypto');
 const {
   createMongoContainer,
@@ -25,7 +25,9 @@ const { cache } = require('../services/cache');
 const { createJob: createImportJob, getJob: getImportJob, updateJob: updateImportJob, scheduleCleanup: scheduleImportJobCleanup } = require('../services/importJobs');
 const { publicRedisUrl, deriveKeyPrefix, ensureAclProvisioned } = require('../services/redisCreds');
 const { FREE_DB_LIMIT } = require('./auth');
-const { syncMongoSni, reloadNginx } = require('../services/nginxManager');
+const { addStreamBlock, removeStreamBlock, reloadNginx } = require('../services/nginxManager');
+const { mongoGatewayEnabled, mongoGatewayPort, mongoGatewayHost, isNetworkRouted } = require('../services/mongoGateway');
+const { pgPublicPort } = require('../services/pgGateway');
 const {
   listMongoDatabases,
   createMongoDatabase,
@@ -105,26 +107,20 @@ function validateCreateBody(body) {
   return { name, type };
 }
 
-// Rebuild the nginx SNI map from the full current set of databases and ask
-// nginx to reload (best-effort — the in-container watcher covers Coolify).
-// Called after anything that changes which containers should be routable.
-async function resyncNginx() {
-  const rows = await prisma.database.findMany({ where: { status: { not: 'deleted' } } });
-  await syncMongoSni(rows);
-  await reloadNginx().catch(() => {});
+// The port a CUSTOMER dials. Mongo rows already store the shared gateway
+// port; Postgres rows store their internal bookkeeping port, but publicly
+// every PG database shares the pgGateway port (routed by username).
+function publicPort(db) {
+  return db.type === 'sql' ? pgPublicPort() : db.port;
 }
 
 function publicShape(db) {
-  // host/port are the SHARED single-port public endpoint (Mongo: per-DB SNI
-  // hostname, PG: VPS host + gateway port) — not the internal bookkeeping
-  // port stored on the row.
-  const pub = publicEndpoint(db);
   return {
     id: db.id,
     name: db.dbName,
     type: db.type,
-    host: pub.host,
-    port: pub.port,
+    host: db.host,
+    port: publicPort(db),
     status: db.status,
     storageUsed: Number(db.storageUsed),
     tlsEnabled: !!db.tlsEnabled,
@@ -158,11 +154,12 @@ router.post('/create', requireAuth, async (req, res, next) => {
     }
   }
 
-  const port = await getNextAvailablePort(type);
+  const useMongoGateway = type === 'nosql' && mongoGatewayEnabled();
+  const port = useMongoGateway ? mongoGatewayPort() : await getNextAvailablePort(type);
   const username = `cdb_${randomToken(6)}`;
   const password = randomToken(24);
-  const host = process.env.VPS_HOST || 'localhost';
-  const routing = 'nginx';
+  const host = useMongoGateway ? mongoGatewayHost() : (process.env.VPS_HOST || 'localhost');
+  const routing = useMongoGateway ? 'mongo-gateway' : 'nginx';
   const { containerName } = deriveNames({ type, dbName: name, userId: req.user.id });
 
   if (tearingDown.has(containerName)) {
@@ -206,19 +203,18 @@ router.post('/create', requireAuth, async (req, res, next) => {
     const fn = type === 'nosql' ? createMongoContainer : createPostgresContainer;
     await fn({ userId: req.user.id, dbName: name, port, username, password, routing });
 
+    // Add nginx stream block + reload, so clients can reach the new container.
+    const internalPort = type === 'nosql' ? 27017 : 5432;
+    await addStreamBlock({ port, host, containerName, internalPort, tlsEnabled, type, routing });
+    await reloadNginx();
+
     const updated = await prisma.database.update({
       where: { id: database.id },
       data: { status: 'active' },
     });
 
-    // Refresh the single-port routing table so clients can reach the new
-    // container (Mongo: SNI map entry; PG: the gateway reads the meta-DB
-    // directly, nothing to write).
-    await resyncNginx();
-
-    const pub = publicEndpoint(updated);
     const connectionUrl = generateConnectionURL(type, {
-      host: pub.host, port: pub.port, username, password, dbName: name, tls: tlsEnabled,
+      host, port: publicPort(updated), username, password, dbName: name, tls: tlsEnabled,
     });
 
     res.status(201).json({
@@ -230,8 +226,8 @@ router.post('/create', requireAuth, async (req, res, next) => {
     console.error('[databases/create] provisioning failed, rolling back:', err.message);
     try { await stopAndRemoveContainer(containerName); } catch (e) { console.error('cleanup:', e.message); }
     try { await removeInitScript(containerName); } catch (e) { /* best-effort */ }
+    try { await removeStreamBlock(port, host); await reloadNginx(); } catch (e) { /* best-effort */ }
     await prisma.database.delete({ where: { id: database.id } }).catch(() => {});
-    try { await resyncNginx(); } catch (e) { /* best-effort */ }
     return res.status(500).json({ error: 'Failed to provision container', detail: err.message });
   }
 });
@@ -273,14 +269,13 @@ router.get('/:id', requireAuth, async (req, res, next) => {
 
     const cred = db.credentials[0];
     const password = decrypt(cred.passwordEncrypted);
-    const pub = publicEndpoint(db);
     const connectionUrl = generateConnectionURL(db.type, {
-      host: pub.host,
-      port: pub.port,
+      host: db.host,
+      port: publicPort(db),
       username: cred.username,
       password,
       dbName: db.dbName,
-      tls: db.type === 'nosql' ? true : !!db.tlsEnabled, // Mongo public URLs are ALWAYS TLS (SNI listener requires it)
+      tls: !!db.tlsEnabled,
     });
 
     // Companion Redis cache link (the second half of the connection
@@ -349,7 +344,7 @@ router.get('/:id/stats', requireAuth, async (req, res, next) => {
     res.json({
       id: db.id,
       name: db.dbName,
-      port: db.port,
+      port: publicPort(db),
       status: db.status,
       container: inspect ? {
         state: inspect.State.Status,
@@ -384,8 +379,11 @@ router.post('/:id/start', requireAuth, async (req, res, next) => {
     const password = decrypt(cred.passwordEncrypted);
     const action = await ensureContainerRunning({ db, username: cred.username, password });
 
-    // Make sure the routing table covers this DB (no-op if already present).
-    await resyncNginx();
+    if (isNetworkRouted(db) && db.containerName) {
+      const internalPort = db.type === 'nosql' ? 27017 : 5432;
+      await addStreamBlock({ port: db.port, host: db.host, containerName: db.containerName, internalPort, tlsEnabled: !!db.tlsEnabled, type: db.type, routing: db.routing });
+      await reloadNginx();
+    }
 
     res.json({ ok: true, action });
   } catch (err) {
@@ -407,10 +405,9 @@ async function loadDatabaseWithUrl(userId, id) {
   const cred = db.credentials[0];
   const password = decrypt(cred.passwordEncrypted);
 
-  const pub = publicEndpoint(db);
   const connectionUrl = generateConnectionURL(db.type, {
-    host: pub.host, port: pub.port, username: cred.username, password, dbName: db.dbName,
-    tls: db.type === 'nosql' ? true : !!db.tlsEnabled, // Mongo public URLs are ALWAYS TLS (SNI listener requires it)
+    host: db.host, port: publicPort(db), username: cred.username, password, dbName: db.dbName,
+    tls: !!db.tlsEnabled, // public URL → through nginx → TLS terminates at proxy
   });
 
   // For nginx-routed DBs we have the container name + the internal port (27017 / 5432).
@@ -418,7 +415,7 @@ async function loadDatabaseWithUrl(userId, id) {
   // Internal hop is plaintext: it stays on the private customdb-network and
   // talks straight to the user-DB container, bypassing the nginx TLS layer.
   let internalUrl = connectionUrl;
-  if (db.routing === 'nginx' && db.containerName) {
+  if (isNetworkRouted(db) && db.containerName) {
     const internalPort = db.type === 'nosql' ? 27017 : 5432;
     internalUrl = generateConnectionURL(db.type, {
       host: db.containerName,
@@ -742,7 +739,7 @@ router.post('/:id/import', requireAuth, uploadSingleFile, async (req, res, next)
     // Internal hop is always plaintext (skips the nginx TLS layer); only the
     // public path through the proxy needs TLS for new (tlsEnabled) DBs.
     let connectionUrl;
-    if (db.routing === 'nginx' && db.containerName) {
+    if (isNetworkRouted(db) && db.containerName) {
       const internalPort = db.type === 'nosql' ? 27017 : 5432;
       connectionUrl = generateConnectionURL(db.type, {
         host: db.containerName, port: internalPort,
@@ -750,11 +747,10 @@ router.post('/:id/import', requireAuth, uploadSingleFile, async (req, res, next)
         tls: false,
       });
     } else {
-      const pub = publicEndpoint(db);
       connectionUrl = generateConnectionURL(db.type, {
-        host: pub.host, port: pub.port,
+        host: db.host, port: publicPort(db),
         username: cred.username, password, dbName: db.dbName,
-        tls: db.type === 'nosql' ? true : !!db.tlsEnabled, // Mongo public URLs are ALWAYS TLS (SNI listener requires it)
+        tls: !!db.tlsEnabled,
       });
     }
 
@@ -869,8 +865,10 @@ router.delete('/:id', requireAuth, async (req, res, next) => {
         try {
           await removeInitScript(containerName);
         } catch (e) { console.error('[delete:bg] init script cleanup:', e.message); }
-        try { await resyncNginx(); }
-        catch (e) { console.error('[delete:bg] nginx cleanup:', e.message); }
+        if (isNetworkRouted(db)) {
+          try { await removeStreamBlock(db.port, db.host); await reloadNginx(); }
+          catch (e) { console.error('[delete:bg] nginx cleanup:', e.message); }
+        }
         console.log(`[delete:bg] finished teardown of ${db.dbName} (${db.id})`);
       } finally {
         tearingDown.delete(containerName);

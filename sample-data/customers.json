@@ -1,0 +1,72 @@
+[
+  {
+    "customerId": "CUST-1001",
+    "name": "Aarav Mehta",
+    "email": "aarav.mehta@example.com",
+    "plan": "pro",
+    "status": "active",
+    "signupDate": "2026-06-01",
+    "monthlySpend": 49.99,
+    "address": {
+      "city": "Mumbai",
+      "country": "India"
+    },
+    "tags": ["startup", "priority"]
+  },
+  {
+    "customerId": "CUST-1002",
+    "name": "Priya Sharma",
+    "email": "priya.sharma@example.com",
+    "plan": "starter",
+    "status": "trial",
+    "signupDate": "2026-06-08",
+    "monthlySpend": 0,
+    "address": {
+      "city": "Delhi",
+      "country": "India"
+    },
+    "tags": ["trial", "newsletter"]
+  },
+  {
+    "customerId": "CUST-1003",
+    "name": "Rohan Iyer",
+    "email": "rohan.iyer@example.com",
+    "plan": "business",
+    "status": "active",
+    "signupDate": "2026-05-22",
+    "monthlySpend": 149.99,
+    "address": {
+      "city": "Bengaluru",
+      "country": "India"
+    },
+    "tags": ["enterprise", "analytics"]
+  },
+  {
+    "customerId": "CUST-1004",
+    "name": "Neha Kapoor",
+    "email": "neha.kapoor@example.com",
+    "plan": "pro",
+    "status": "paused",
+    "signupDate": "2026-04-15",
+    "monthlySpend": 49.99,
+    "address": {
+      "city": "Pune",
+      "country": "India"
+    },
+    "tags": ["billing-review"]
+  },
+  {
+    "customerId": "CUST-1005",
+    "name": "Kabir Khan",
+    "email": "kabir.khan@example.com",
+    "plan": "starter",
+    "status": "active",
+    "signupDate": "2026-06-18",
+    "monthlySpend": 19.99,
+    "address": {
+      "city": "Hyderabad",
+      "country": "India"
+    },
+    "tags": ["new"]
+  }
+]

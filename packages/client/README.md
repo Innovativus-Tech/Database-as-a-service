@@ -18,7 +18,7 @@ npm install @customdb/client pg
 const { CustomDBMongo } = require('@customdb/client');
 
 const db = new CustomDBMongo(
-  'customdb://USER:PASSWORD@dbaas.innovativus.tech:27018/news_DB?tls=true&tlsAllowInvalidCertificates=true'
+  'customdb://USER:PASSWORD@m-xxxx.mongo.dbaas.innovativus.tech:27017/news_DB?tls=true&tlsAllowInvalidCertificates=true'
 );
 
 // Cached reads (~60s TTL by default)
@@ -80,7 +80,7 @@ Customers don't share cache space, can't see each other's data, and don't need t
 new CustomDBMongo(connectionString, {
   defaultTtl: 60,                      // seconds; default 60
   debug: true,                          // log cache hits/misses
-  cacheConfigUrl: 'https://api.dbaas.innovativus.tech',  // override auto-detect
+  cacheConfigUrl: 'https://dbaas.innovativus.tech',  // override auto-detect
   mongoOptions: { /* passed to MongoClient */ },
 });
 
@@ -88,7 +88,7 @@ new CustomDBPostgres({
   connectionString,
   defaultTtl: 60,
   debug: true,
-  cacheConfigUrl: 'https://api.dbaas.innovativus.tech',
+  cacheConfigUrl: 'https://dbaas.innovativus.tech',
   poolOptions: { /* passed to pg.Pool */ },
 });
 ```

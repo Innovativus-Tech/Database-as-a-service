@@ -3,9 +3,10 @@
 # Notes:
 #  - The backend mounts /var/run/docker.sock so Dockerode can provision user DB containers.
 #  - User DB containers are created on the customdb-network (external, see bottom).
-#  - Single-port data plane: nginx serves ALL Mongo databases on one port
-#    (TLS SNI routing, needs wildcard DNS *.mongo.<VPS_HOST>); the backend's
-#    pgGateway serves ALL Postgres databases on one port (routes by username).
+#  - Single-port data plane: nginx serves ALL Mongo databases on one shared
+#    port (TLS SNI routing by per-DB hostname — needs wildcard DNS
+#    *.mongo.<VPS_HOST>); the backend's pgGateway serves ALL Postgres
+#    databases on one shared port (routes by username). No per-DB port ranges.
 #  - The meta DB and per-user data volumes are stored under /data on the host.
 
 services:
@@ -90,11 +91,11 @@ services:
       REDIS_URL: redis://default:${REDIS_PASSWORD}@redis:6379
       REDIS_PUBLIC_HOST: ${VPS_HOST}
       REDIS_PUBLIC_PORT: 6380
-      # Single-port routing. These are the PUBLIC ports baked into every
-      # connection string — they must match the port mappings below (nginx
-      # for Mongo, this container for Postgres). Defaults reuse the first
-      # ports of the old published ranges so upgrades can't collide.
-      MONGO_PUBLIC_PORT: ${MONGO_PUBLIC_PORT:-27018}
+      MONGO_GATEWAY_ENABLED: ${MONGO_GATEWAY_ENABLED:-true}
+      MONGO_GATEWAY_DOMAIN: ${MONGO_GATEWAY_DOMAIN:-}
+      MONGO_GATEWAY_PORT: ${MONGO_GATEWAY_PORT:-27017}
+      # Shared public Postgres port (see ports: below) — baked into every PG
+      # connection string; the in-process pgGateway routes by username.
       PG_PUBLIC_PORT: ${PG_PUBLIC_PORT:-5433}
       # Optional per-user caps. Empty = unlimited (internal deployment).
       DB_LIMIT: ${DB_LIMIT:-}
@@ -112,7 +113,8 @@ services:
       UV_THREADPOOL_SIZE: 16
     ports:
       # ALL Postgres databases share this one public port — the backend's
-      # pgGateway routes by username to the right container (see pgGateway.js).
+      # pgGateway parses the PG startup message and routes by the globally
+      # unique per-database username (see services/pgGateway.js).
       - "${PG_PUBLIC_PORT:-5433}:5432"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
@@ -143,8 +145,17 @@ services:
     container_name: customdb-frontend
     environment:
       NEXT_PUBLIC_API_URL: ${PUBLIC_API_URL}
+      INTERNAL_API_URL: http://backend:4000
     ports:
       - "3030:3030"
+    networks:
+      # Coolify's proxy network = so Traefik can route public dashboard traffic
+      # to the Next.js service. Publishing 3030 is still useful for direct VPS
+      # access, but proxy routing needs shared network reachability.
+      - coolify
+      # Internal app network = so same-origin /api/* requests can be proxied
+      # from Next.js to the backend even if the public API domain is down.
+      - customdb-network
     restart: unless-stopped
     healthcheck:
       # Hits the app's own /api/healthz route — no auth, no backend call.
@@ -207,11 +218,13 @@ services:
     volumes:
       - ./nginx/stream.d:/etc/nginx/stream.d
     ports:
-      # ALL Mongo databases share this one public port. nginx terminates TLS
-      # and routes by SNI hostname (<db>-<id8>.mongo.<VPS_HOST>) to the right
-      # container — no more one-port-per-database ranges. Requires a wildcard
-      # DNS record: *.mongo.<VPS_HOST> -> this host.
-      - "${MONGO_PUBLIC_PORT:-27018}:27017"
+      # Shared Mongo gateway port — the ONLY published Mongo port. Every
+      # database gets a unique hostname under MONGO_GATEWAY_DOMAIN and nginx
+      # routes by TLS SNI. The old per-database ranges (27018-27117 /
+      # 5433-5532) are gone: legacy Mongo rows are migrated to gateway
+      # routing on backend boot, and ALL Postgres traffic goes through the
+      # backend's single pgGateway port instead of nginx.
+      - "${MONGO_GATEWAY_PORT:-27017}:27017"
     networks: [customdb-network]
     restart: unless-stopped
     healthcheck:

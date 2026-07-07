@@ -1,0 +1,7 @@
+order_id,customer_id,order_date,product,category,quantity,unit_price,total,status
+ORD-5001,CUST-1001,2026-06-21,Database Backup Add-on,storage,2,9.99,19.98,paid
+ORD-5002,CUST-1003,2026-06-22,Business Plan Subscription,subscription,1,149.99,149.99,paid
+ORD-5003,CUST-1002,2026-06-24,Starter Plan Trial,subscription,1,0.00,0.00,trial
+ORD-5004,CUST-1005,2026-06-25,Starter Plan Subscription,subscription,1,19.99,19.99,paid
+ORD-5005,CUST-1001,2026-06-28,Extra Database Instance,compute,3,14.99,44.97,pending
+ORD-5006,CUST-1004,2026-06-30,Pro Plan Subscription,subscription,1,49.99,49.99,paused

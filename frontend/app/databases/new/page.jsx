@@ -282,8 +282,9 @@ export default function NewDatabasePage() {
               <div className="text-xs text-text-secondary mb-2">Your connection string</div>
               <div className="font-mono text-sm text-text-secondary break-all">
                 <span className="text-accent">{isMongo ? 'mongodb://' : 'postgresql://'}</span>
-                admin:<span className="text-text-muted">●●●●●●</span>@db.customdb.io:
-                {isMongo ? '27021' : '5432'}/
+                admin:<span className="text-text-muted">●●●●●●</span>@
+                {isMongo ? 'db-host-assigned-on-create' : 'dbaas.example.com'}:
+                {isMongo ? '27017' : 'assigned'}/
                 <span className="text-mongo">{name}</span>
               </div>
             </div>
@@ -330,7 +331,7 @@ export default function NewDatabasePage() {
               <div className="flex justify-between">
                 <span className="text-sm text-text-secondary">Port</span>
                 <span className="text-sm text-text-primary font-mono">
-                  {isMongo ? '27021' : '5432'} <span className="text-text-muted">(auto-assigned)</span>
+                  {isMongo ? '27017' : 'auto-assigned'} <span className="text-text-muted">({isMongo ? 'shared gateway' : 'from range'})</span>
                 </span>
               </div>
               <div className="flex justify-between">

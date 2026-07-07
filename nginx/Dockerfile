@@ -24,11 +24,11 @@ RUN mkdir -p /etc/nginx/tls && \
       -days   3650 \
       -subj   "/CN=customdb-self-signed"
 
-# Stream blocks live in this dir and are included from nginx.conf.
-RUN mkdir -p /etc/nginx/stream.d
+# Stream blocks live in this dir and are included from nginx.conf. Gateway map
+# entries live in a child dir so the top-level include only sees server blocks.
+RUN mkdir -p /etc/nginx/stream.d/mongo-gateway
 
-# One shared Mongo port (TLS SNI routing) — see stream.d/customdb-sni.conf.
-EXPOSE 27017
+EXPOSE 27017 27018-27999 5433-5999
 # Watcher runs in the background; exec keeps nginx as the main process so it
 # still receives container stop signals directly.
 CMD ["/bin/sh", "-c", "/reload-watcher.sh & exec nginx -g 'daemon off;'"]
