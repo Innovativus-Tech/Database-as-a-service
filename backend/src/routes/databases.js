@@ -203,10 +203,16 @@ router.post('/create', requireAuth, async (req, res, next) => {
     const fn = type === 'nosql' ? createMongoContainer : createPostgresContainer;
     await fn({ userId: req.user.id, dbName: name, port, username, password, routing });
 
-    // Add nginx stream block + reload, so clients can reach the new container.
-    const internalPort = type === 'nosql' ? 27017 : 5432;
-    await addStreamBlock({ port, host, containerName, internalPort, tlsEnabled, type, routing });
-    await reloadNginx();
+    // Only Mongo needs an nginx route (the shared SNI gateway map). Postgres
+    // is routed entirely by pgGateway on the backend container — it looks up
+    // containerName per-connection from the meta-DB, no static nginx config
+    // involved, so writing a stream block here would just be a dead file
+    // (nginx no longer publishes any per-database Postgres port).
+    if (type === 'nosql') {
+      const internalPort = 27017;
+      await addStreamBlock({ port, host, containerName, internalPort, tlsEnabled, type, routing });
+      await reloadNginx();
+    }
 
     const updated = await prisma.database.update({
       where: { id: database.id },
@@ -226,7 +232,9 @@ router.post('/create', requireAuth, async (req, res, next) => {
     console.error('[databases/create] provisioning failed, rolling back:', err.message);
     try { await stopAndRemoveContainer(containerName); } catch (e) { console.error('cleanup:', e.message); }
     try { await removeInitScript(containerName); } catch (e) { /* best-effort */ }
-    try { await removeStreamBlock(port, host); await reloadNginx(); } catch (e) { /* best-effort */ }
+    if (type === 'nosql') {
+      try { await removeStreamBlock(port, host); await reloadNginx(); } catch (e) { /* best-effort */ }
+    }
     await prisma.database.delete({ where: { id: database.id } }).catch(() => {});
     return res.status(500).json({ error: 'Failed to provision container', detail: err.message });
   }
@@ -379,9 +387,10 @@ router.post('/:id/start', requireAuth, async (req, res, next) => {
     const password = decrypt(cred.passwordEncrypted);
     const action = await ensureContainerRunning({ db, username: cred.username, password });
 
-    if (isNetworkRouted(db) && db.containerName) {
-      const internalPort = db.type === 'nosql' ? 27017 : 5432;
-      await addStreamBlock({ port: db.port, host: db.host, containerName: db.containerName, internalPort, tlsEnabled: !!db.tlsEnabled, type: db.type, routing: db.routing });
+    // Only Mongo's route lives in nginx; Postgres is resolved per-connection
+    // by pgGateway, so there's no static config to re-add here for it.
+    if (db.type === 'nosql' && isNetworkRouted(db) && db.containerName) {
+      await addStreamBlock({ port: db.port, host: db.host, containerName: db.containerName, internalPort: 27017, tlsEnabled: !!db.tlsEnabled, type: db.type, routing: db.routing });
       await reloadNginx();
     }
 
@@ -865,7 +874,9 @@ router.delete('/:id', requireAuth, async (req, res, next) => {
         try {
           await removeInitScript(containerName);
         } catch (e) { console.error('[delete:bg] init script cleanup:', e.message); }
-        if (isNetworkRouted(db)) {
+        // Postgres never had an nginx route to begin with (pgGateway routes
+        // it per-connection, not via static config) — only Mongo needs this.
+        if (db.type === 'nosql' && isNetworkRouted(db)) {
           try { await removeStreamBlock(db.port, db.host); await reloadNginx(); }
           catch (e) { console.error('[delete:bg] nginx cleanup:', e.message); }
         }

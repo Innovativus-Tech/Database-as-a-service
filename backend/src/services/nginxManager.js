@@ -129,14 +129,16 @@ async function syncFromDatabaseRows(rows) {
   }
   for (const r of rows) {
     if (!r.containerName) continue;
-    const internalPort = r.type === 'nosql' ? 27017 : 5432;
     if (r.routing === 'mongo-gateway') {
-      await addGatewayMap({ host: r.host, containerName: r.containerName, internalPort });
-    } else if (r.routing === 'nginx') {
-      await addStreamBlock({ port: r.port, containerName: r.containerName, internalPort, tlsEnabled: !!r.tlsEnabled, type: r.type });
+      await addGatewayMap({ host: r.host, containerName: r.containerName, internalPort: 27017 });
+    } else if (r.routing === 'nginx' && r.type === 'nosql') {
+      // Legacy per-port Mongo routing (MONGO_GATEWAY_ENABLED=false escape
+      // hatch only) — Postgres never gets a static nginx block, it's routed
+      // per-connection by pgGateway instead.
+      await addStreamBlock({ port: r.port, containerName: r.containerName, internalPort: 27017, tlsEnabled: !!r.tlsEnabled, type: r.type });
     }
   }
-  return rows.filter((r) => r.routing === 'nginx' || r.routing === 'mongo-gateway').length;
+  return rows.filter((r) => (r.routing === 'nginx' && r.type === 'nosql') || r.routing === 'mongo-gateway').length;
 }
 
 module.exports = {
