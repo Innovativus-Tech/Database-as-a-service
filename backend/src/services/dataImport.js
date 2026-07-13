@@ -241,10 +241,25 @@ async function importMongodumpZip({ containerName, mongoUser, mongoPassword, mon
     await execFileP('docker', ['exec', containerName, 'mkdir', '-p', inContainerDir]);
     await execFileP('docker', ['cp', dumpRoot + '/.', `${containerName}:${inContainerDir}`]);
 
-    const { stdout, stderr } = await execFileP('docker', [
-      'exec', containerName,
-      'mongorestore', '--uri', internalUri, '--drop', inContainerDir,
-    ]);
+    // mongorestore recreates databases under their ORIGINAL names from the
+    // dump's folder structure — so a dump of Atlas's "newspro" restored into
+    // a CustomDB database named "NewsPro" landed in a separate (case-
+    // sensitive) "newspro" db that the dashboard's default view never shows,
+    // and users concluded the import silently failed. When the dump contains
+    // exactly one database, remap it into THIS database's primary name so
+    // the data appears where the connection string and Browse Data expect
+    // it. Multi-database dumps keep their original names (no sane single
+    // target exists), which the schema-switcher in Browse Data can reach.
+    const dumpDbDirs = fs.readdirSync(dumpRoot, { withFileTypes: true })
+      .filter((e) => e.isDirectory())
+      .map((e) => e.name);
+    const restoreArgs = ['exec', containerName, 'mongorestore', '--uri', internalUri, '--drop'];
+    if (dumpDbDirs.length === 1 && dumpDbDirs[0] !== mongoDbName) {
+      restoreArgs.push('--nsFrom', `${dumpDbDirs[0]}.*`, '--nsTo', `${mongoDbName}.*`);
+    }
+    restoreArgs.push(inContainerDir);
+
+    const { stdout, stderr } = await execFileP('docker', restoreArgs);
     await execFileP('docker', ['exec', containerName, 'rm', '-rf', inContainerDir]).catch(() => {});
 
     return { count: null, target: 'mongorestore', log: (stderr || stdout || '').slice(-2000) };
