@@ -207,9 +207,9 @@ export default function DashboardPage() {
                 sparkline
               />
               <StatCard
-                label="Storage Used"
+                label="Disk Used"
                 value={fmtBytes(totalStorage)}
-                sub="self-hosted · no cap"
+                sub="includes Mongo engine files"
               />
               <StatCard
                 label="Active Connections · Live now"

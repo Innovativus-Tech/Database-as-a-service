@@ -94,9 +94,9 @@ export default function UsagePage() {
                 icon={Database}
               />
               <StatCard
-                label="Storage Used"
+                label="Disk Used"
                 value={fmtBytes(totalStorage)}
-                sub="self-hosted · no cap"
+                sub="includes database engine files"
                 icon={HardDrive}
               />
               <StatCard
