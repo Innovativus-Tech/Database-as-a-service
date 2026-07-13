@@ -77,6 +77,20 @@ async function listMongoDatabases(connectionUrl) {
   });
 }
 
+async function listMongoDatabasesWithPrimary(connectionUrl, primaryDbName) {
+  const names = new Set();
+  try {
+    for (const name of await listMongoDatabases(connectionUrl)) names.add(name);
+  } catch (err) {
+    // Some Mongo roles/topologies do not expose admin.listDatabases even when
+    // direct access to the app database works. The caller can still browse the
+    // primary database via listCollections, so keep that path available.
+    if (!primaryDbName) throw err;
+  }
+  if (primaryDbName) names.add(primaryDbName);
+  return [...names].sort((a, b) => a.localeCompare(b));
+}
+
 // Mongo only materializes a database once it has at least one real collection
 // in it, so "creating" one means creating its first collection in the same step.
 async function createMongoDatabase(connectionUrl, dbName, firstCollection) {
@@ -439,6 +453,7 @@ async function evictPoolsForHost(hostname) {
 
 module.exports = {
   listMongoDatabases,
+  listMongoDatabasesWithPrimary,
   createMongoDatabase,
   dropMongoDatabase,
   listMongoCollections,

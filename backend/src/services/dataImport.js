@@ -68,6 +68,18 @@ function findMongodumpRoot(extractedRoot) {
   return extractedRoot;
 }
 
+async function listMongoCollectionCountsInContainer(containerName, uri, dbName) {
+  const dbNameJson = JSON.stringify(dbName);
+  const script = [
+    `const target = db.getSiblingDB(${dbNameJson});`,
+    `const names = target.getCollectionNames().filter((name) => !name.startsWith('system.')).sort();`,
+    `print(JSON.stringify(names.map((name) => ({ name, count: target.getCollection(name).estimatedDocumentCount() }))));`,
+  ].join('\n');
+  const { stdout } = await execFileP('docker', ['exec', containerName, 'mongosh', uri, '--quiet', '--eval', script]);
+  const line = stdout.trim().split('\n').filter(Boolean).pop() || '[]';
+  return JSON.parse(line);
+}
+
 function csvRecordStream(filePath) {
   return fs.createReadStream(filePath).pipe(
     csvParseStream({ columns: true, skip_empty_lines: true, trim: true })
@@ -282,11 +294,26 @@ async function importMongodumpZip({ containerName, mongoUser, mongoPassword, mon
 
     const { stdout, stderr } = await execFileP('docker', restoreArgs);
     await execFileP('docker', ['exec', containerName, 'rm', '-rf', inContainerDir]).catch(() => {});
+    const restoredCollections = await listMongoCollectionCountsInContainer(containerName, internalUri, restoredDatabase);
+    if (restoredCollections.length === 0) {
+      const sourceCollections = dumpDbDirs.length === 1 && dumpDbDirs[0] !== restoredDatabase
+        ? await listMongoCollectionCountsInContainer(containerName, internalUri, dumpDbDirs[0]).catch(() => [])
+        : [];
+      if (sourceCollections.length > 0) {
+        throw Object.assign(
+          new Error(`mongorestore wrote data to "${dumpDbDirs[0]}", but Browse Data is looking at "${restoredDatabase}". Re-import after redeploying the namespace remap fix.`),
+          { status: 500 }
+        );
+      }
+      throw Object.assign(new Error(`mongorestore finished, but no collections were found in "${restoredDatabase}".`), { status: 500 });
+    }
+    const restoredCount = restoredCollections.reduce((sum, collection) => sum + (collection.count || 0), 0);
 
     return {
-      count: null,
+      count: restoredCount,
       target: restoredDatabase,
       source: dumpDbDirs.length === 1 ? dumpDbDirs[0] : 'multiple databases',
+      collections: restoredCollections,
       log: (stderr || stdout || '').slice(-2000),
     };
   } finally {

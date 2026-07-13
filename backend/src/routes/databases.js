@@ -30,6 +30,7 @@ const { mongoGatewayEnabled, mongoGatewayPort, mongoGatewayHost, isNetworkRouted
 const { pgPublicPort } = require('../services/pgGateway');
 const {
   listMongoDatabases,
+  listMongoDatabasesWithPrimary,
   createMongoDatabase,
   dropMongoDatabase,
   listMongoCollections,
@@ -463,7 +464,7 @@ router.get('/:id/schemas', requireAuth, async (req, res) => {
     const { db, internalUrl } = loaded;
 
     const schemas = db.type === 'nosql'
-      ? await listMongoDatabases(internalUrl)
+      ? await listMongoDatabasesWithPrimary(internalUrl, db.dbName)
       : await listPostgresSchemas(internalUrl);
 
     res.json({ schemas, type: db.type, primary: db.type === 'nosql' ? db.dbName : 'public' });
