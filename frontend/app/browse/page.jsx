@@ -1,7 +1,8 @@
 'use client';
 
-import { useState, useEffect, useMemo } from 'react';
+import { Suspense, useState, useEffect, useMemo } from 'react';
 import { useQuery } from '@tanstack/react-query';
+import { useSearchParams } from 'next/navigation';
 import Link from 'next/link';
 import { motion, AnimatePresence } from 'framer-motion';
 import { toast } from 'sonner';
@@ -452,8 +453,10 @@ function DocSlideOver({ db, collection, schema, isMongo, doc, onClose, onChanged
   );
 }
 
-export default function BrowsePage() {
+function BrowsePageContent() {
   useRequireAuth();
+  const searchParams = useSearchParams();
+  const initialDbId = searchParams.get('db');
   const [selectedDbId, setSelectedDbId]  = useState(null);
   const [selectedColl, setSelectedColl]  = useState(null);
   const [skip, setSkip] = useState(0);
@@ -478,8 +481,10 @@ export default function BrowsePage() {
 
   // Auto-pick first DB once loaded
   useEffect(() => {
-    if (!selectedDbId && dbs.length > 0) setSelectedDbId(dbs[0].id);
-  }, [dbs, selectedDbId]);
+    if (selectedDbId || dbs.length === 0) return;
+    const requested = initialDbId && dbs.some((db) => db.id === initialDbId) ? initialDbId : null;
+    setSelectedDbId(requested || dbs[0].id);
+  }, [dbs, initialDbId, selectedDbId]);
 
   // Reset selection when changing DBs
   useEffect(() => {
@@ -860,5 +865,13 @@ export default function BrowsePage() {
         </AnimatePresence>
       </main>
     </AppShell>
+  );
+}
+
+export default function BrowsePage() {
+  return (
+    <Suspense fallback={<AppShell><Topbar title="Browse Data" subtitle="Loading..." /></AppShell>}>
+      <BrowsePageContent />
+    </Suspense>
   );
 }

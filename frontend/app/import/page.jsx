@@ -488,7 +488,9 @@ export default function ImportPage() {
                     </div>
                     <h2 className="text-lg font-medium">Import complete</h2>
                     <p className="mt-1 text-sm text-text-secondary">
-                      {result.kind}{typeof result.count === 'number' && ` · ${result.count.toLocaleString()} rows`}
+                      {result.kind}
+                      {result.target && ` → ${result.target}`}
+                      {typeof result.count === 'number' && ` · ${result.count.toLocaleString()} rows`}
                     </p>
 
                     {result.log && (
@@ -499,8 +501,8 @@ export default function ImportPage() {
                     )}
 
                     <div className="mt-6 flex gap-2">
-                      <Link href={`/databases/${databaseId}`}>
-                        <Button variant="ghost">Open database</Button>
+                      <Link href={`/browse?db=${encodeURIComponent(databaseId)}`}>
+                        <Button variant="ghost">Browse data</Button>
                       </Link>
                       <Button onClick={reset}>Import another</Button>
                     </div>

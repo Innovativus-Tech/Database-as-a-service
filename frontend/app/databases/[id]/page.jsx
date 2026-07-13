@@ -547,6 +547,9 @@ export default function DatabaseDetailPage() {
                       file: {importResult.file} → target: {importResult.target}
                       {importResult.count != null && <> · {importResult.count} rows</>}
                     </div>
+                    <Link href={`/browse?db=${encodeURIComponent(id)}`} className="mt-3 inline-flex text-xs font-medium text-accent hover:text-accent-hover">
+                      Open in Browse Data
+                    </Link>
                   </div>
                 )}
                 <button

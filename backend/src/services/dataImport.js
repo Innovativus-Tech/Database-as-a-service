@@ -42,6 +42,32 @@ function countCsvRows(filePath) {
   });
 }
 
+function listMongodumpDatabaseDirs(root) {
+  return fs.readdirSync(root, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && entry.name !== '__MACOSX' && !entry.name.startsWith('.'))
+    .filter((entry) => {
+      const dir = path.join(root, entry.name);
+      return fs.readdirSync(dir, { withFileTypes: true })
+        .some((child) => child.isFile() && child.name.toLowerCase().endsWith('.bson'));
+    })
+    .map((entry) => entry.name);
+}
+
+function findMongodumpRoot(extractedRoot) {
+  const directDbDirs = listMongodumpDatabaseDirs(extractedRoot);
+  if (directDbDirs.length > 0) return extractedRoot;
+
+  const dirs = fs.readdirSync(extractedRoot, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && entry.name !== '__MACOSX' && !entry.name.startsWith('.'));
+
+  for (const dir of dirs) {
+    const candidate = path.join(extractedRoot, dir.name);
+    if (listMongodumpDatabaseDirs(candidate).length > 0) return candidate;
+  }
+
+  return extractedRoot;
+}
+
 function csvRecordStream(filePath) {
   return fs.createReadStream(filePath).pipe(
     csvParseStream({ columns: true, skip_empty_lines: true, trim: true })
@@ -226,15 +252,10 @@ async function importMongodumpZip({ containerName, mongoUser, mongoPassword, mon
 
     zip.extractAllTo(tmpDir, /*overwrite*/ true);
 
-    // mongorestore expects the dump root. Some zips wrap it in a "dump/" dir, some don't.
-    const dumpRoot = (() => {
-      const entries = fs.readdirSync(tmpDir);
-      if (entries.length === 1) {
-        const only = path.join(tmpDir, entries[0]);
-        if (fs.statSync(only).isDirectory()) return only;
-      }
-      return tmpDir;
-    })();
+    // mongorestore expects the dump root. Some zips wrap it in a "dump/" dir,
+    // and macOS archives can add metadata folders, so find the directory that
+    // actually contains database folders with .bson collection files.
+    const dumpRoot = findMongodumpRoot(tmpDir);
 
     const inContainerDir = '/tmp/customdb-restore';
     await execFileP('docker', ['exec', containerName, 'rm', '-rf', inContainerDir]);
@@ -250,19 +271,24 @@ async function importMongodumpZip({ containerName, mongoUser, mongoPassword, mon
     // the data appears where the connection string and Browse Data expect
     // it. Multi-database dumps keep their original names (no sane single
     // target exists), which the schema-switcher in Browse Data can reach.
-    const dumpDbDirs = fs.readdirSync(dumpRoot, { withFileTypes: true })
-      .filter((e) => e.isDirectory())
-      .map((e) => e.name);
+    const dumpDbDirs = listMongodumpDatabaseDirs(dumpRoot);
     const restoreArgs = ['exec', containerName, 'mongorestore', '--uri', internalUri, '--drop'];
+    let restoredDatabase = dumpDbDirs.length === 1 ? dumpDbDirs[0] : mongoDbName;
     if (dumpDbDirs.length === 1 && dumpDbDirs[0] !== mongoDbName) {
       restoreArgs.push('--nsFrom', `${dumpDbDirs[0]}.*`, '--nsTo', `${mongoDbName}.*`);
+      restoredDatabase = mongoDbName;
     }
     restoreArgs.push(inContainerDir);
 
     const { stdout, stderr } = await execFileP('docker', restoreArgs);
     await execFileP('docker', ['exec', containerName, 'rm', '-rf', inContainerDir]).catch(() => {});
 
-    return { count: null, target: 'mongorestore', log: (stderr || stdout || '').slice(-2000) };
+    return {
+      count: null,
+      target: restoredDatabase,
+      source: dumpDbDirs.length === 1 ? dumpDbDirs[0] : 'multiple databases',
+      log: (stderr || stdout || '').slice(-2000),
+    };
   } finally {
     fs.promises.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
   }
