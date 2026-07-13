@@ -243,7 +243,7 @@ async function importMongodumpZip({ containerName, mongoUser, mongoPassword, mon
   // mongorestore runs INSIDE the container, so it must reach mongod via the
   // container's own loopback on the internal port (27017), not the host-side mapped port.
   const enc = encodeURIComponent;
-  const internalUri = `mongodb://${enc(mongoUser)}:${enc(mongoPassword)}@127.0.0.1:27017/${enc(mongoDbName)}?authSource=admin`;
+  const internalUri = `mongodb://${enc(mongoUser)}:${enc(mongoPassword)}@127.0.0.1:27017/?authSource=admin`;
   const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'cdb-mongodump-'));
   try {
     const zip = new AdmZip(filePath);
@@ -274,46 +274,57 @@ async function importMongodumpZip({ containerName, mongoUser, mongoPassword, mon
     await execFileP('docker', ['exec', containerName, 'mkdir', '-p', inContainerDir]);
     await execFileP('docker', ['cp', dumpRoot + '/.', `${containerName}:${inContainerDir}`]);
 
-    // mongorestore recreates databases under their ORIGINAL names from the
-    // dump's folder structure — so a dump of Atlas's "newspro" restored into
-    // a CustomDB database named "NewsPro" landed in a separate (case-
-    // sensitive) "newspro" db that the dashboard's default view never shows,
-    // and users concluded the import silently failed. When the dump contains
-    // exactly one database, remap it into THIS database's primary name so
-    // the data appears where the connection string and Browse Data expect
-    // it. Multi-database dumps keep their original names (no sane single
-    // target exists), which the schema-switcher in Browse Data can reach.
     const dumpDbDirs = listMongodumpDatabaseDirs(dumpRoot);
-    const restoreArgs = ['exec', containerName, 'mongorestore', '--uri', internalUri, '--drop'];
-    let restoredDatabase = dumpDbDirs.length === 1 ? dumpDbDirs[0] : mongoDbName;
-    if (dumpDbDirs.length === 1 && dumpDbDirs[0] !== mongoDbName) {
-      restoreArgs.push('--nsFrom', `${dumpDbDirs[0]}.*`, '--nsTo', `${mongoDbName}.*`);
-      restoredDatabase = mongoDbName;
+    if (dumpDbDirs.length === 0) {
+      throw Object.assign(new Error('Archive does not look like a mongodump: no database folders with .bson files were found'), { status: 400 });
     }
-    restoreArgs.push(inContainerDir);
+
+    const restoreArgs = ['exec', containerName, 'mongorestore', '--uri', internalUri, '--drop'];
+    let restoredDatabase = mongoDbName;
+    if (dumpDbDirs.length === 1) {
+      // A single database dump should land in this CustomDB database's primary
+      // name, so Browse Data and the generated connection string see it.
+      // Single-database dumps are the common dashboard upload path. Restoring
+      // the concrete database directory with --db is more reliable across
+      // mongorestore versions than namespace rewrites against the dump root.
+      restoreArgs.push('--db', mongoDbName, path.posix.join(inContainerDir, dumpDbDirs[0]));
+    } else {
+      restoredDatabase = 'multiple databases';
+      restoreArgs.push(inContainerDir);
+    }
 
     const { stdout, stderr } = await execFileP('docker', restoreArgs);
     await execFileP('docker', ['exec', containerName, 'rm', '-rf', inContainerDir]).catch(() => {});
-    const restoredCollections = await listMongoCollectionCountsInContainer(containerName, internalUri, restoredDatabase);
-    if (restoredCollections.length === 0) {
-      const sourceCollections = dumpDbDirs.length === 1 && dumpDbDirs[0] !== restoredDatabase
+    const verifyDatabase = mongoDbName;
+    const restoredCollections = await listMongoCollectionCountsInContainer(containerName, internalUri, verifyDatabase);
+    if (dumpDbDirs.length === 1 && restoredCollections.length === 0) {
+      const sourceCollections = dumpDbDirs[0] !== verifyDatabase
         ? await listMongoCollectionCountsInContainer(containerName, internalUri, dumpDbDirs[0]).catch(() => [])
         : [];
       if (sourceCollections.length > 0) {
         throw Object.assign(
-          new Error(`mongorestore wrote data to "${dumpDbDirs[0]}", but Browse Data is looking at "${restoredDatabase}". Re-import after redeploying the namespace remap fix.`),
+          new Error(`mongorestore wrote data to "${dumpDbDirs[0]}", but Browse Data is looking at "${verifyDatabase}".`),
           { status: 500 }
         );
       }
-      throw Object.assign(new Error(`mongorestore finished, but no collections were found in "${restoredDatabase}".`), { status: 500 });
+      throw Object.assign(new Error(`mongorestore finished, but no collections were found in "${verifyDatabase}". Log: ${(stderr || stdout || '').slice(-1000)}`), { status: 500 });
     }
-    const restoredCount = restoredCollections.reduce((sum, collection) => sum + (collection.count || 0), 0);
+    const verifiedCollections = dumpDbDirs.length === 1
+      ? restoredCollections
+      : (await Promise.all(dumpDbDirs.map(async (dbName) => {
+          const collections = await listMongoCollectionCountsInContainer(containerName, internalUri, dbName);
+          return collections.map((collection) => ({ ...collection, database: dbName }));
+        }))).flat();
+    if (verifiedCollections.length === 0) {
+      throw Object.assign(new Error(`mongorestore finished, but no collections were found. Log: ${(stderr || stdout || '').slice(-1000)}`), { status: 500 });
+    }
+    const restoredCount = verifiedCollections.reduce((sum, collection) => sum + (collection.count || 0), 0);
 
     return {
       count: restoredCount,
       target: restoredDatabase,
       source: dumpDbDirs.length === 1 ? dumpDbDirs[0] : 'multiple databases',
-      collections: restoredCollections,
+      collections: verifiedCollections,
       log: (stderr || stdout || '').slice(-2000),
     };
   } finally {
