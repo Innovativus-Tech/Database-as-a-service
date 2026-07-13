@@ -22,6 +22,27 @@ function inferTargetFromFilename(originalName, fallback) {
   return validIdent(cleaned) ? cleaned : fallback;
 }
 
+function assertMongoUri(uri) {
+  if (typeof uri !== 'string' || !/^mongodb(\+srv)?:\/\//i.test(uri.trim())) {
+    throw Object.assign(new Error('Source Mongo URL must start with mongodb:// or mongodb+srv://'), { status: 400 });
+  }
+  return uri.trim();
+}
+
+function dbNameFromMongoUri(uri) {
+  const parsed = new URL(uri);
+  const dbName = decodeURIComponent((parsed.pathname || '').replace(/^\/+/, '').split('/')[0] || '');
+  if (!dbName) {
+    throw Object.assign(new Error('Source Mongo URL must include a database name, for example mongodb+srv://.../newspro'), { status: 400 });
+  }
+  return dbName;
+}
+
+function cleanIndexSpec(index) {
+  const { v, ns, ...spec } = index;
+  return spec;
+}
+
 // Streamed newline count so progress bars have a total without buffering the
 // file. Approximate when quoted fields contain embedded newlines — the UI
 // clamps at 100%, so an estimate is fine. Subtracts the header row.
@@ -165,6 +186,98 @@ async function importCsvToMongo({ connectionUrl, dbName, collection, filePath, o
     return { count: inserted, target: collection };
   } finally {
     await client.close().catch(() => {});
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Mongo URL → MongoDB (server-side database copy)
+// ──────────────────────────────────────────────────────────────────────────────
+async function importMongoUrlToMongo({ sourceMongoUri, targetConnectionUrl, targetDbName, onProgress }) {
+  const sourceUri = assertMongoUri(sourceMongoUri);
+  const sourceDbName = dbNameFromMongoUri(sourceUri);
+  const sourceClient = new MongoClient(sourceUri, { serverSelectionTimeoutMS: 10000 });
+  const targetClient = new MongoClient(targetConnectionUrl, { serverSelectionTimeoutMS: 10000 });
+
+  try {
+    await sourceClient.connect();
+    await targetClient.connect();
+
+    const sourceDb = sourceClient.db(sourceDbName);
+    const targetDb = targetClient.db(targetDbName);
+    const collections = (await sourceDb.listCollections({}, { nameOnly: true }).toArray())
+      .map((collection) => collection.name)
+      .filter((name) => !name.startsWith('system.'))
+      .sort();
+
+    if (collections.length === 0) {
+      throw Object.assign(new Error(`No collections found in source database "${sourceDbName}"`), { status: 400 });
+    }
+
+    const totals = new Map();
+    let totalDocs = 0;
+    for (const name of collections) {
+      const count = await sourceDb.collection(name).estimatedDocumentCount();
+      totals.set(name, count);
+      totalDocs += count;
+    }
+    onProgress?.(0, totalDocs || null);
+
+    let copied = 0;
+    const copiedCollections = [];
+    const BATCH = 1000;
+    for (const name of collections) {
+      const sourceCollection = sourceDb.collection(name);
+      const targetCollection = targetDb.collection(name);
+      await targetCollection.drop().catch((err) => {
+        if (err?.codeName !== 'NamespaceNotFound') throw err;
+      });
+
+      let copiedInCollection = 0;
+      let batch = [];
+      const cursor = sourceCollection.find({}, { noCursorTimeout: true });
+      try {
+        for await (const doc of cursor) {
+          batch.push(doc);
+          if (batch.length >= BATCH) {
+            const result = await targetCollection.insertMany(batch, { ordered: false });
+            copied += result.insertedCount;
+            copiedInCollection += result.insertedCount;
+            batch = [];
+            onProgress?.(copied, totalDocs || null);
+          }
+        }
+      } finally {
+        await cursor.close().catch(() => {});
+      }
+      if (batch.length > 0) {
+        const result = await targetCollection.insertMany(batch, { ordered: false });
+        copied += result.insertedCount;
+        copiedInCollection += result.insertedCount;
+        onProgress?.(copied, totalDocs || null);
+      }
+      if (copiedInCollection === 0 && totals.get(name) === 0) {
+        await targetDb.createCollection(name).catch((err) => {
+          if (err?.codeName !== 'NamespaceExists') throw err;
+        });
+      }
+      const indexes = (await sourceCollection.listIndexes().toArray())
+        .filter((index) => index.name !== '_id_')
+        .map(cleanIndexSpec);
+      if (indexes.length > 0) {
+        await targetCollection.createIndexes(indexes);
+      }
+      copiedCollections.push({ name, count: copiedInCollection });
+    }
+
+    return {
+      count: copied,
+      target: targetDbName,
+      source: sourceDbName,
+      collections: copiedCollections,
+    };
+  } finally {
+    await sourceClient.close().catch(() => {});
+    await targetClient.close().catch(() => {});
   }
 }
 
@@ -356,6 +469,16 @@ async function importPgDumpSql({ containerName, pgUser, pgPassword, pgDbName, fi
 // Dispatcher
 // ──────────────────────────────────────────────────────────────────────────────
 async function dispatchImport({ db, credentials, connectionUrl, containerName, file, queryTarget, onProgress }) {
+  if (file?.sourceMongoUri) {
+    if (db.type !== 'nosql') throw Object.assign(new Error('Mongo URL imports require a NoSQL database'), { status: 400 });
+    return { kind: 'mongo-url→mongo', ...await importMongoUrlToMongo({
+      sourceMongoUri: file.sourceMongoUri,
+      targetConnectionUrl: connectionUrl,
+      targetDbName: db.dbName,
+      onProgress,
+    }) };
+  }
+
   const ext = path.extname(file.originalname).toLowerCase();
   const fallback = ext === '.sql' ? 'sql_import' : 'import';
   const target = (queryTarget && validIdent(queryTarget))

@@ -6,7 +6,7 @@ import Link from 'next/link';
 import { motion, AnimatePresence } from 'framer-motion';
 import { toast } from 'sonner';
 import {
-  FileJson, FileText, Archive, FileCode2, Upload, ArrowRight, Check, Database, Leaf, X,
+  FileJson, FileText, Archive, FileCode2, Link2, Upload, ArrowRight, Check, Database, Leaf, X,
 } from 'lucide-react';
 import { api } from '@/lib/api';
 import { useRequireAuth } from '@/lib/auth';
@@ -22,6 +22,7 @@ const SOURCES = [
   { id: 'json', label: 'JSON File',  icon: FileJson,  desc: 'Upload an array of JSON documents',  exts: '.json',   dbTypes: ['nosql'] },
   { id: 'csv',  label: 'CSV File',   icon: FileText,  desc: 'Each row becomes a doc / table row', exts: '.csv',    dbTypes: ['nosql', 'sql'] },
   { id: 'zip',  label: 'mongodump',  icon: Archive,   desc: 'Restore a mongodump archive',         exts: '.zip',    dbTypes: ['nosql'] },
+  { id: 'mongo-url', label: 'Mongo URL', icon: Link2, desc: 'Copy from an existing Mongo database', exts: 'mongodb://', dbTypes: ['nosql'] },
   { id: 'sql',  label: 'pg_dump',    icon: FileCode2, desc: 'Run a Postgres SQL dump',             exts: '.sql',    dbTypes: ['sql'] },
 ];
 
@@ -176,6 +177,7 @@ export default function ImportPage() {
   const [sourceId, setSourceId]   = useState(null);
   const [databaseId, setDbId]     = useState(null);
   const [target, setTarget]       = useState('');
+  const [sourceMongoUri, setSourceMongoUri] = useState('');
   const [file, setFile]           = useState(null);
   const [busy, setBusy]           = useState(false);
   const [result, setResult]       = useState(null);
@@ -197,18 +199,20 @@ export default function ImportPage() {
 
   function reset() {
     if (pollRef.current) clearInterval(pollRef.current);
-    setStep(1); setSourceId(null); setDbId(null); setTarget(''); setFile(null);
+    setStep(1); setSourceId(null); setDbId(null); setTarget(''); setSourceMongoUri(''); setFile(null);
     setResult(null); setError(null); setJobStatus(null); setBusy(false);
   }
 
   useEffect(() => () => { if (pollRef.current) clearInterval(pollRef.current); }, []);
 
   async function onImport() {
-    if (!databaseId || !file) return;
+    if (!databaseId || (sourceId === 'mongo-url' ? !sourceMongoUri.trim() : !file)) return;
     setBusy(true); setError(null); setJobStatus(null);
     setStep(4);
     try {
-      const { jobId } = await api.importFile(databaseId, file, target || undefined);
+      const { jobId } = sourceId === 'mongo-url'
+        ? await api.importMongoUrl(databaseId, sourceMongoUri.trim())
+        : await api.importFile(databaseId, file, target || undefined);
       // Tolerate transient poll failures — while the backend is busy inserting
       // a large file, an occasional request can time out or blip. Only give up
       // on a real auth failure, a lost job, or many consecutive misses.
@@ -368,17 +372,26 @@ export default function ImportPage() {
                     />
                   )}
 
-                  {/* File drop zone */}
-                  <div>
-                    <label className="mb-1.5 block text-xs font-medium text-text-secondary">File</label>
-                    <DropZone accept={source.exts} file={file} onFile={setFile} onRemove={() => setFile(null)} />
-                  </div>
+                  {sourceId === 'mongo-url' ? (
+                    <Input
+                      label="Source MongoDB URL"
+                      placeholder="mongodb+srv://user:password@cluster.example.net/sourceDb"
+                      value={sourceMongoUri}
+                      onChange={(e) => setSourceMongoUri(e.target.value)}
+                      helper="The URL must include the source database name in the path. Matching target collections will be replaced."
+                    />
+                  ) : (
+                    <div>
+                      <label className="mb-1.5 block text-xs font-medium text-text-secondary">File</label>
+                      <DropZone accept={source.exts} file={file} onFile={setFile} onRemove={() => setFile(null)} />
+                    </div>
+                  )}
                 </div>
 
                 <div className="mt-6 flex justify-between">
                   <Button variant="ghost" onClick={() => setStep(1)}>Back</Button>
                   <Button
-                    disabled={!databaseId || !file}
+                    disabled={!databaseId || (sourceId === 'mongo-url' ? !sourceMongoUri.trim() : !file)}
                     onClick={() => setStep(3)}
                     rightIcon={<ArrowRight className="h-4 w-4" />}
                   >
@@ -412,13 +425,23 @@ export default function ImportPage() {
                     </div>
                     <div className="p-4">
                       <dt className="text-xs uppercase tracking-wider text-text-muted">Target</dt>
-                      <dd className="mt-1 font-mono text-sm">{target || <span className="text-text-muted">from filename</span>}</dd>
+                      <dd className="mt-1 font-mono text-sm">
+                        {sourceId === 'mongo-url'
+                          ? (dbs.find(d => d.id === databaseId)?.name || 'selected database')
+                          : (target || <span className="text-text-muted">from filename</span>)}
+                      </dd>
                     </div>
                     <div className="p-4">
-                      <dt className="text-xs uppercase tracking-wider text-text-muted">File</dt>
+                      <dt className="text-xs uppercase tracking-wider text-text-muted">{sourceId === 'mongo-url' ? 'Source URL' : 'File'}</dt>
                       <dd className="mt-1 text-sm">
-                        <span className="font-mono">{file?.name}</span>
-                        <span className="ml-2 text-text-muted">({(file?.size / 1024).toFixed(1)} KB)</span>
+                        {sourceId === 'mongo-url' ? (
+                          <span className="font-mono break-all">{sourceMongoUri.replace(/:([^:@/?#]+)@/, ':****@')}</span>
+                        ) : (
+                          <>
+                            <span className="font-mono">{file?.name}</span>
+                            <span className="ml-2 text-text-muted">({(file?.size / 1024).toFixed(1)} KB)</span>
+                          </>
+                        )}
                       </dd>
                     </div>
                   </dl>
@@ -465,7 +488,7 @@ export default function ImportPage() {
                       </>
                     ) : (
                       <p className="mt-1.5 text-sm text-text-secondary">
-                        Running {source?.label.toLowerCase()} restore — this can take a while for large dumps.
+                        Running {source?.label.toLowerCase()} import — this can take a while for large datasets.
                       </p>
                     )}
                   </Card>

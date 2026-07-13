@@ -78,6 +78,8 @@ export const api = {
     const qs = target ? `?target=${encodeURIComponent(target)}` : '';
     return request(`/api/databases/${id}/import${qs}`, { method: 'POST', formData: fd });
   },
+  importMongoUrl: (id, sourceMongoUri) =>
+    request(`/api/databases/${id}/import/mongo-url`, { method: 'POST', body: { sourceMongoUri } }),
   getImportJobStatus: (id, jobId) => request(`/api/databases/${id}/import/${jobId}/status`),
 
   listSchemas: (id) => request(`/api/databases/${id}/schemas`),

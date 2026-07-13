@@ -5,7 +5,7 @@ import { useParams, useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
 import { toast } from 'sonner';
 import {
-  ArrowLeft, Table2, Upload, RotateCw, Trash2, Copy, Eye, EyeOff, Leaf, Database,
+  ArrowLeft, Table2, Upload, Link2, RotateCw, Trash2, Copy, Eye, EyeOff, Leaf, Database,
 } from 'lucide-react';
 import { api } from '@/lib/api';
 import { useRequireAuth, useAuth } from '@/lib/auth';
@@ -48,6 +48,7 @@ export default function DatabaseDetailPage() {
   const [importResult, setImportResult] = useState(null);
   const [importError, setImportError] = useState(null);
   const [importProgress, setImportProgress] = useState(null); // { processed, total }
+  const [sourceMongoUri, setSourceMongoUri] = useState('');
   const fileInputRef = useRef(null);
   const targetInputRef = useRef(null);
   const pollRef = useRef(null);
@@ -91,19 +92,7 @@ export default function DatabaseDetailPage() {
     }
   }
 
-  async function onImport(e) {
-    e.preventDefault();
-    setImportError(null);
-    setImportResult(null);
-    setImportProgress(null);
-    const file = fileInputRef.current?.files?.[0];
-    if (!file) { setImportError('Choose a file first'); return; }
-    setImportBusy(true);
-    try {
-      const target = targetInputRef.current?.value?.trim() || undefined;
-      // The import API is job-based: the upload returns { jobId } immediately
-      // and the actual insert runs server-side — poll for real progress.
-      const { jobId } = await api.importFile(id, file, target);
+  function pollImportJob(jobId, { clearFile = false } = {}) {
       let consecutiveFailures = 0;
       pollRef.current = setInterval(async () => {
         try {
@@ -115,7 +104,7 @@ export default function DatabaseDetailPage() {
             setImportResult(status.result);
             setImportBusy(false);
             setImportProgress(null);
-            if (fileInputRef.current) fileInputRef.current.value = '';
+            if (clearFile && fileInputRef.current) fileInputRef.current.value = '';
             toast.success('Import complete');
             refreshStats();
           } else if (status.status === 'error') {
@@ -136,6 +125,37 @@ export default function DatabaseDetailPage() {
           }
         }
       }, 1000);
+  }
+
+  async function onImport(e) {
+    e.preventDefault();
+    setImportError(null);
+    setImportResult(null);
+    setImportProgress(null);
+    const file = fileInputRef.current?.files?.[0];
+    if (!file) { setImportError('Choose a file first'); return; }
+    setImportBusy(true);
+    try {
+      const target = targetInputRef.current?.value?.trim() || undefined;
+      const { jobId } = await api.importFile(id, file, target);
+      pollImportJob(jobId, { clearFile: true });
+    } catch (err) {
+      setImportError(err.message);
+      setImportBusy(false);
+    }
+  }
+
+  async function onMongoUrlImport(e) {
+    e.preventDefault();
+    setImportError(null);
+    setImportResult(null);
+    setImportProgress(null);
+    const uri = sourceMongoUri.trim();
+    if (!uri) { setImportError('Paste a source MongoDB URL first'); return; }
+    setImportBusy(true);
+    try {
+      const { jobId } = await api.importMongoUrl(id, uri);
+      pollImportJob(jobId);
     } catch (err) {
       setImportError(err.message);
       setImportBusy(false);
@@ -560,6 +580,33 @@ export default function DatabaseDetailPage() {
                   <Upload className="h-[18px] w-[18px]" strokeWidth={1.75} />
                   {importBusy ? 'Importing...' : 'Upload & import'}
                 </button>
+                {isMongo && (
+                  <div className="space-y-3 rounded-md border border-border bg-bg-inset p-3">
+                    <div>
+                      <div className="text-sm font-medium text-text-primary">Dump Mongo URL</div>
+                      <p className="mt-1 text-xs text-text-secondary">
+                        Paste a source MongoDB URI. Its database will be copied into this database, replacing matching collections.
+                      </p>
+                    </div>
+                    <input
+                      type="text"
+                      value={sourceMongoUri}
+                      onChange={(e) => setSourceMongoUri(e.target.value)}
+                      onKeyDown={(e) => { if (e.key === 'Enter') onMongoUrlImport(e); }}
+                      placeholder="mongodb+srv://user:password@cluster.example.net/sourceDb"
+                      className="block w-full rounded-md border border-border bg-bg-card px-3 py-2 text-sm font-mono text-text-primary placeholder:text-text-muted focus:border-accent focus:outline-none"
+                    />
+                    <button
+                      type="button"
+                      onClick={onMongoUrlImport}
+                      disabled={importBusy || !sourceMongoUri.trim()}
+                      className="w-full h-10 rounded border border-border-strong text-sm font-medium text-text-primary inline-flex items-center justify-center gap-2 hover:bg-bg-row disabled:opacity-50 transition-colors"
+                    >
+                      <Link2 className="h-4 w-4" strokeWidth={1.75} />
+                      {importBusy ? 'Importing...' : 'Dump Mongo URL'}
+                    </button>
+                  </div>
+                )}
               </form>
             </div>
           </div>

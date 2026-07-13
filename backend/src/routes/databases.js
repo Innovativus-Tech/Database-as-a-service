@@ -805,6 +805,64 @@ router.post('/:id/import', requireAuth, uploadSingleFile, async (req, res, next)
   }
 });
 
+router.post('/:id/import/mongo-url', requireAuth, async (req, res, next) => {
+  if (!validIdOr404(req, res)) return;
+  try {
+    const sourceMongoUri = typeof req.body?.sourceMongoUri === 'string' ? req.body.sourceMongoUri.trim() : '';
+    if (!/^mongodb(\+srv)?:\/\//i.test(sourceMongoUri)) {
+      return res.status(400).json({ error: 'sourceMongoUri must start with mongodb:// or mongodb+srv://' });
+    }
+
+    const db = await prisma.database.findFirst({
+      where: { id: req.params.id, userId: req.user.id, status: 'active' },
+      include: { credentials: true },
+    });
+    if (!db) return res.status(404).json({ error: 'Database not found or not active' });
+    if (db.type !== 'nosql') return res.status(400).json({ error: 'Mongo URL imports require a NoSQL database' });
+
+    const cred = db.credentials[0];
+    const password = decrypt(cred.passwordEncrypted);
+
+    const connectionUrl = isNetworkRouted(db) && db.containerName
+      ? generateConnectionURL(db.type, {
+          host: db.containerName, port: 27017,
+          username: cred.username, password, dbName: db.dbName,
+          tls: false,
+        })
+      : generateConnectionURL(db.type, {
+          host: db.host, port: publicPort(db),
+          username: cred.username, password, dbName: db.dbName,
+          tls: !!db.tlsEnabled,
+        });
+
+    const jobId = createImportJob();
+    runImport(
+      {
+        db: { type: db.type, dbName: db.dbName },
+        credentials: { username: cred.username, password },
+        connectionUrl,
+        containerName: resolveNames(db).containerName,
+        file: { sourceMongoUri },
+      },
+      (processed, total) => updateImportJob(jobId, { processed, total })
+    )
+      .then((result) => {
+        updateImportJob(jobId, { status: 'done', result: { file: 'Mongo URL', ...result } });
+      })
+      .catch((err) => {
+        console.error('[databases/:id/import/mongo-url]', err);
+        updateImportJob(jobId, { status: 'error', error: err.message || 'Mongo URL import failed' });
+      })
+      .finally(() => {
+        scheduleImportJobCleanup(jobId);
+      });
+
+    res.status(202).json({ ok: true, jobId });
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.get('/:id/import/:jobId/status', requireAuth, async (req, res) => {
   if (!validIdOr404(req, res)) return;
   const job = getImportJob(req.params.jobId);
