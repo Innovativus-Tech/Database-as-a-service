@@ -234,7 +234,7 @@ async function importMongoUrlToMongo({ sourceMongoUri, targetConnectionUrl, targ
 
       let copiedInCollection = 0;
       let batch = [];
-      const cursor = sourceCollection.find({}, { noCursorTimeout: true });
+      const cursor = sourceCollection.find({});
       try {
         for await (const doc of cursor) {
           batch.push(doc);
