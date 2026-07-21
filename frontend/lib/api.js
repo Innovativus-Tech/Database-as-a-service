@@ -59,6 +59,9 @@ export const api = {
   changePassword: (data) => request('/api/auth/password', { method: 'POST', body: data }),
   deleteAccount:  () => request('/api/auth/me', { method: 'DELETE', body: { confirm: 'CONFIRM' } }),
 
+  adminStats: () => request('/api/admin/stats'),
+  adminUsers: () => request('/api/admin/users'),
+
   getSessions:   () => request('/api/auth/sessions'),
   revokeSession: (id) => request(`/api/auth/sessions/${id}`, { method: 'DELETE' }),
 

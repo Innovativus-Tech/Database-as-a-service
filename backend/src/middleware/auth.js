@@ -46,7 +46,7 @@ async function requireAuth(req, res, next) {
       }).catch(() => {});
     }
 
-    req.user = { id: payload.sub, email: payload.email };
+    req.user = { id: payload.sub, email: payload.email, role: payload.role || 'user' };
     req.sessionJti = payload.jti;
     next();
   } catch (err) {
@@ -54,9 +54,27 @@ async function requireAuth(req, res, next) {
   }
 }
 
+// Admin gate — always re-checks the role in Postgres rather than trusting the
+// JWT claim, so demoting an admin takes effect immediately instead of when
+// their 7-day token expires. Must run after requireAuth.
+async function requireAdmin(req, res, next) {
+  try {
+    const user = await prisma.user.findUnique({
+      where: { id: req.user.id },
+      select: { role: true },
+    });
+    if (!user || user.role !== 'admin') {
+      return res.status(403).json({ error: 'Admin access required' });
+    }
+    next();
+  } catch (err) {
+    next(err);
+  }
+}
+
 function signToken(user, jti) {
   return jwt.sign(
-    { sub: user.id, email: user.email, jti },
+    { sub: user.id, email: user.email, role: user.role || 'user', jti },
     process.env.JWT_SECRET,
     { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
   );
@@ -77,4 +95,4 @@ async function createSession(user, req) {
   return signToken(user, jti);
 }
 
-module.exports = { requireAuth, signToken, createSession, invalidateSession };
+module.exports = { requireAuth, requireAdmin, signToken, createSession, invalidateSession };

@@ -72,6 +72,11 @@ services:
       DATABASE_URL: postgresql://customdb:${META_DB_PASSWORD:-customdb}@meta-db:5432/customdb_meta?schema=public
       JWT_SECRET: ${JWT_SECRET}
       JWT_EXPIRES_IN: 7d
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-}
       VPS_HOST: ${VPS_HOST}
       DOCKER_SOCKET: /var/run/docker.sock
       CREDENTIAL_ENC_KEY: ${CREDENTIAL_ENC_KEY}

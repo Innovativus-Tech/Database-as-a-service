@@ -5,6 +5,15 @@ const { authenticator } = require('otplib');
 const qrcode = require('qrcode');
 const prisma = require('../prisma');
 const { createSession, requireAuth, invalidateSession } = require('../middleware/auth');
+const {
+  validate,
+  signupSchema,
+  loginSchema,
+  forgotPasswordSchema,
+  resetPasswordSchema,
+  changePasswordSchema,
+  updateProfileSchema,
+} = require('../validation/authSchemas');
 const { sendPasswordResetEmail } = require('../services/email');
 const {
   stopAndRemoveContainer,
@@ -15,8 +24,10 @@ const { removeStreamBlock, reloadNginx } = require('../services/nginxManager');
 
 const router = express.Router();
 
+// Google OAuth: GET /api/auth/google + /api/auth/google/callback
+router.use(require('./googleAuth'));
+
 const BCRYPT_ROUNDS = 12;
-const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const PASSWORD_RESET_TTL_MS = 30 * 60 * 1000;
 
 // Plan limits. This deployment is self-hosted for one organization, so both
@@ -57,21 +68,12 @@ function clientIp(req) {
   return (req.headers['x-forwarded-for']?.split(',')[0].trim()) || req.ip || 'unknown';
 }
 
-function validateCredentials(body) {
-  const email = typeof body?.email === 'string' ? body.email.trim().toLowerCase() : '';
-  const password = typeof body?.password === 'string' ? body.password : '';
-
-  if (!EMAIL_RE.test(email)) return { error: 'Invalid email address' };
-  if (password.length < 8) return { error: 'Password must be at least 8 characters' };
-
-  return { email, password };
-}
-
 function publicUser(user) {
   return {
     id: user.id,
     email: user.email,
     plan: user.plan,
+    role: user.role,
     displayName: user.displayName,
     avatarUrl: user.avatarUrl,
     fullName: user.fullName,
@@ -79,10 +81,6 @@ function publicUser(user) {
     twoFactorEnabled: user.twoFactorEnabled,
     createdAt: user.createdAt,
   };
-}
-
-function normalizeEmail(value) {
-  return typeof value === 'string' ? value.trim().toLowerCase() : '';
 }
 
 function hashResetToken(token) {
@@ -96,7 +94,7 @@ function getFrontendOrigin(req) {
   return `${proto}://${host}`;
 }
 
-router.post('/signup', async (req, res, next) => {
+router.post('/signup', validate(signupSchema), async (req, res, next) => {
   try {
     // Signups mint sessions AND (later) real Docker containers — keep bots
     // from bulk-registering. Window matches the login limiter's shape.
@@ -104,13 +102,7 @@ router.post('/signup', async (req, res, next) => {
       return res.status(429).json({ error: 'Too many signups from this address. Try again later.' });
     }
 
-    const { error, email, password } = validateCredentials(req.body);
-    if (error) return res.status(400).json({ error });
-
-    const fullName = typeof req.body?.fullName === 'string' ? req.body.fullName.trim().slice(0, 80) : '';
-    const organizationName = typeof req.body?.organizationName === 'string' ? req.body.organizationName.trim().slice(0, 80) : '';
-    if (!fullName) return res.status(400).json({ error: 'Full name is required' });
-    if (!organizationName) return res.status(400).json({ error: 'Organization name is required' });
+    const { email, password, fullName, organizationName } = req.body;
 
     const existing = await prisma.user.findUnique({ where: { email } });
     if (existing) return res.status(409).json({ error: 'Email already registered' });
@@ -127,10 +119,9 @@ router.post('/signup', async (req, res, next) => {
   }
 });
 
-router.post('/login', async (req, res, next) => {
+router.post('/login', validate(loginSchema), async (req, res, next) => {
   try {
-    const { error, email, password } = validateCredentials(req.body);
-    if (error) return res.status(400).json({ error });
+    const { email, password } = req.body;
 
     if (!rateLimit(`login:${clientIp(req)}`, 20, 15 * 60 * 1000)) {
       return res.status(429).json({ error: 'Too many login attempts. Try again in a few minutes.' });
@@ -146,7 +137,7 @@ router.post('/login', async (req, res, next) => {
     if (!ok) return res.status(401).json({ error: 'Invalid email or password' });
 
     if (user.twoFactorEnabled) {
-      const code = typeof req.body?.totp === 'string' ? req.body.totp.trim() : '';
+      const code = req.body.totp || '';
       if (!code) return res.json({ twoFactorRequired: true });
       const valid = authenticator.check(code, user.twoFactorSecret);
       if (!valid) return res.status(401).json({ error: 'Invalid 2FA code' });
@@ -159,10 +150,9 @@ router.post('/login', async (req, res, next) => {
   }
 });
 
-router.post('/forgot-password', async (req, res, next) => {
+router.post('/forgot-password', validate(forgotPasswordSchema), async (req, res, next) => {
   try {
-    const email = normalizeEmail(req.body?.email);
-    if (!EMAIL_RE.test(email)) return res.status(400).json({ error: 'Invalid email address' });
+    const { email } = req.body;
 
     if (!rateLimit(`forgot:${clientIp(req)}`, 5, 15 * 60 * 1000) ||
         !rateLimit(`forgot-email:${email}`, 3, 15 * 60 * 1000)) {
@@ -207,16 +197,13 @@ router.post('/forgot-password', async (req, res, next) => {
   }
 });
 
-router.post('/reset-password', async (req, res, next) => {
+router.post('/reset-password', validate(resetPasswordSchema), async (req, res, next) => {
   try {
     if (!rateLimit(`reset:${clientIp(req)}`, 10, 15 * 60 * 1000)) {
       return res.status(429).json({ error: 'Too many attempts. Try again in a few minutes.' });
     }
 
-    const token = typeof req.body?.token === 'string' ? req.body.token.trim() : '';
-    const newPassword = typeof req.body?.password === 'string' ? req.body.password : '';
-    if (!token) return res.status(400).json({ error: 'Reset token is required' });
-    if (newPassword.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
+    const { token, password: newPassword } = req.body;
 
     const tokenHash = hashResetToken(token);
     const resetToken = await prisma.passwordResetToken.findUnique({
@@ -267,34 +254,13 @@ router.get('/me', requireAuth, async (req, res, next) => {
 // ──────────────────────────────────────────────────────────────────────────────
 // PATCH /api/auth/me — profile (display name, avatar)
 // ──────────────────────────────────────────────────────────────────────────────
-router.patch('/me', requireAuth, async (req, res, next) => {
+router.patch('/me', requireAuth, validate(updateProfileSchema), async (req, res, next) => {
   try {
     const data = {};
-    if (typeof req.body?.displayName === 'string') {
-      const name = req.body.displayName.trim().slice(0, 80);
-      data.displayName = name || null;
-    }
-    if (typeof req.body?.fullName === 'string') {
-      const name = req.body.fullName.trim().slice(0, 80);
-      data.fullName = name || null;
-    }
-    if (typeof req.body?.organizationName === 'string') {
-      const name = req.body.organizationName.trim().slice(0, 80);
-      data.organizationName = name || null;
-    }
-    if (typeof req.body?.avatarUrl === 'string') {
-      if (req.body.avatarUrl === '') {
-        data.avatarUrl = null;
-      } else {
-        if (!/^data:image\/(png|jpe?g|webp|gif);base64,/.test(req.body.avatarUrl)) {
-          return res.status(400).json({ error: 'avatarUrl must be a base64 image data URL' });
-        }
-        if (req.body.avatarUrl.length > 600_000) {
-          return res.status(400).json({ error: 'Image too large (max ~400KB)' });
-        }
-        data.avatarUrl = req.body.avatarUrl;
-      }
-    }
+    if (req.body.displayName !== undefined) data.displayName = req.body.displayName || null;
+    if (req.body.fullName !== undefined) data.fullName = req.body.fullName || null;
+    if (req.body.organizationName !== undefined) data.organizationName = req.body.organizationName || null;
+    if (req.body.avatarUrl !== undefined) data.avatarUrl = req.body.avatarUrl || null;
     const user = await prisma.user.update({ where: { id: req.user.id }, data });
     res.json({ user: publicUser(user) });
   } catch (err) {
@@ -305,11 +271,9 @@ router.patch('/me', requireAuth, async (req, res, next) => {
 // ──────────────────────────────────────────────────────────────────────────────
 // POST /api/auth/password — change password, revoke other sessions
 // ──────────────────────────────────────────────────────────────────────────────
-router.post('/password', requireAuth, async (req, res, next) => {
+router.post('/password', requireAuth, validate(changePasswordSchema), async (req, res, next) => {
   try {
-    const currentPassword = typeof req.body?.currentPassword === 'string' ? req.body.currentPassword : '';
-    const newPassword = typeof req.body?.newPassword === 'string' ? req.body.newPassword : '';
-    if (newPassword.length < 8) return res.status(400).json({ error: 'New password must be at least 8 characters' });
+    const { currentPassword, newPassword } = req.body;
 
     const user = await prisma.user.findUnique({ where: { id: req.user.id } });
     const ok = await bcrypt.compare(currentPassword, user.passwordHash);

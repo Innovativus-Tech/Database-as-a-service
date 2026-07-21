@@ -12,6 +12,7 @@ import {
   Settings,
   Cog,
   LogOut,
+  ShieldCheck,
 } from 'lucide-react';
 import { useAuth } from '@/lib/auth';
 import { cn } from '@/lib/cn';
@@ -42,6 +43,13 @@ export default function Sidebar() {
   const name = user?.displayName || user?.fullName || email;
   const initial = (name || '?')[0].toUpperCase();
 
+  const visibleSections = user?.role === 'admin'
+    ? [...sections, {
+        label: 'Admin',
+        items: [{ href: '/admin', label: 'Admin Panel', icon: ShieldCheck }],
+      }]
+    : sections;
+
   return (
     <aside className="fixed left-0 top-0 z-30 flex h-screen w-55 flex-col border-r border-border bg-bg-sidebar">
       {/* Logo */}
@@ -52,7 +60,7 @@ export default function Sidebar() {
 
       {/* Nav */}
       <nav className="flex-1 overflow-y-auto px-2 py-4">
-        {sections.map((section) => (
+        {visibleSections.map((section) => (
           <div key={section.label} className="mb-6">
             <div className="px-3 pb-1.5 text-xs font-medium uppercase tracking-wider text-text-muted">
               {section.label}

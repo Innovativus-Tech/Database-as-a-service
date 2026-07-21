@@ -96,6 +96,7 @@ app.get('/health', async (req, res) => {
 });
 
 app.use('/api/auth', dashboardCors, require('./routes/auth').router);
+app.use('/api/admin', dashboardCors, require('./routes/admin'));
 app.use('/api/databases', dashboardCors, require('./routes/databases'));
 app.use('/api', openCors, require('./routes/cacheConfig'));
 
@@ -155,12 +156,49 @@ async function migrateLegacyMongoRows() {
   return legacy.length;
 }
 
+// Seed the platform admin account from ADMIN_EMAIL / ADMIN_PASSWORD env vars.
+// Idempotent: creates the user if missing, otherwise just guarantees the role
+// is admin (an existing user's chosen password is never overwritten).
+async function ensureAdminUser() {
+  const email = (process.env.ADMIN_EMAIL || '').trim().toLowerCase();
+  const password = process.env.ADMIN_PASSWORD || '';
+  if (!email || !password) return;
+  if (password.length < 8) {
+    console.warn('[admin-seed] ADMIN_PASSWORD must be at least 8 characters — skipping seed');
+    return;
+  }
+  const bcrypt = require('bcrypt');
+  const existing = await prisma.user.findUnique({ where: { email } });
+  if (existing) {
+    if (existing.role !== 'admin') {
+      await prisma.user.update({ where: { id: existing.id }, data: { role: 'admin' } });
+      console.log(`[admin-seed] promoted ${email} to admin`);
+    }
+    return;
+  }
+  const passwordHash = await bcrypt.hash(password, 12);
+  await prisma.user.create({
+    data: {
+      email,
+      passwordHash,
+      role: 'admin',
+      fullName: 'Administrator',
+      displayName: 'Administrator',
+      organizationName: 'CustomDB',
+    },
+  });
+  console.log(`[admin-seed] created admin account ${email}`);
+}
+
 async function bootstrap() {
   const { ensureNetwork } = require('./services/dockerNetwork');
   const { syncFromDatabaseRows, reloadNginx } = require('./services/nginxManager');
   const { ensureContainerRunning } = require('./services/provisioning');
   const { decrypt } = require('./services/crypto');
   try {
+    await ensureAdminUser().catch((err) =>
+      console.warn('[admin-seed] failed (will retry next boot):', err.message));
+
     await ensureNetwork();
 
     await migrateLegacyMongoRows().catch((err) =>

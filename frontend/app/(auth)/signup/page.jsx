@@ -8,6 +8,7 @@ import { toast } from 'sonner';
 import { api } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
 import Button from '@/components/ui/Button';
+import GoogleButton from '@/components/ui/GoogleButton';
 import Input from '@/components/ui/Input';
 
 export default function SignupPage() {
@@ -52,7 +53,16 @@ export default function SignupPage() {
         <h1 className="text-2xl font-semibold tracking-tight">Create your account</h1>
         <p className="mt-1 text-sm text-text-secondary">Spin up MongoDB & Postgres in seconds.</p>
 
-        <form onSubmit={onSubmit} className="mt-8 space-y-4">
+        <div className="mt-8">
+          <GoogleButton label="Sign up with Google" />
+          <div className="mt-6 flex items-center gap-3">
+            <span className="h-px flex-1 bg-border" />
+            <span className="text-xs uppercase tracking-wider text-text-muted">or</span>
+            <span className="h-px flex-1 bg-border" />
+          </div>
+        </div>
+
+        <form onSubmit={onSubmit} className="mt-6 space-y-4">
           <Input
             label="Organization Name"
             required

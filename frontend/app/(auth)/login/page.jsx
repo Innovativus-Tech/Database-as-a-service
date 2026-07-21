@@ -1,18 +1,29 @@
 'use client';
 
-import { useState } from 'react';
+import { Suspense, useEffect, useState } from 'react';
 import Link from 'next/link';
-import { useRouter } from 'next/navigation';
+import { useRouter, useSearchParams } from 'next/navigation';
 import { motion } from 'framer-motion';
 import { toast } from 'sonner';
 import { api } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
 import Button from '@/components/ui/Button';
+import GoogleButton from '@/components/ui/GoogleButton';
 import Input from '@/components/ui/Input';
 
-export default function LoginPage() {
+function LoginForm() {
   const router = useRouter();
+  const searchParams = useSearchParams();
   const { login } = useAuth();
+
+  // Google OAuth failures land back here as /login?error=...
+  useEffect(() => {
+    const oauthError = searchParams.get('error');
+    if (oauthError) {
+      toast.error(oauthError);
+      router.replace('/login');
+    }
+  }, [searchParams, router]);
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [totp, setTotp] = useState('');
@@ -53,7 +64,16 @@ export default function LoginPage() {
         <h1 className="text-2xl font-semibold tracking-tight">Sign in</h1>
         <p className="mt-1 text-sm text-text-secondary">Manage your self-hosted databases.</p>
 
-        <form onSubmit={onSubmit} className="mt-8 space-y-4">
+        <div className="mt-8">
+          <GoogleButton label="Sign in with Google" />
+          <div className="mt-6 flex items-center gap-3">
+            <span className="h-px flex-1 bg-border" />
+            <span className="text-xs uppercase tracking-wider text-text-muted">or</span>
+            <span className="h-px flex-1 bg-border" />
+          </div>
+        </div>
+
+        <form onSubmit={onSubmit} className="mt-6 space-y-4">
           {!needsTotp ? (
             <>
               <Input
@@ -120,5 +140,13 @@ export default function LoginPage() {
         </p>
       </motion.div>
     </div>
+  );
+}
+
+export default function LoginPage() {
+  return (
+    <Suspense fallback={<div className="flex min-h-screen items-center justify-center px-6 text-sm text-text-secondary">Loading...</div>}>
+      <LoginForm />
+    </Suspense>
   );
 }

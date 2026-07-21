@@ -18,6 +18,11 @@ enum Plan {
   pro
 }
 
+enum Role {
+  user
+  admin
+}
+
 enum DatabaseType {
   nosql
   sql
@@ -35,6 +40,8 @@ model User {
   email            String     @unique
   passwordHash     String
   plan             Plan       @default(free)
+  role             Role       @default(user)
+  googleId         String?    @unique
   displayName      String?
   avatarUrl        String?
   fullName         String?
