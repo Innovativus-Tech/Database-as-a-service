@@ -162,6 +162,15 @@ services:
       # from Next.js to the backend even if the public API domain is down.
       - customdb-network
     restart: unless-stopped
+    # Reserve memory and lower the OOM priority so the Next server isn't the
+    # kernel's first kill target under host memory pressure. Without this the
+    # frontend could get OOM-killed mid-traffic; restart: unless-stopped then
+    # brought it back with a NEW container IP, leaving Traefik's route pointing
+    # at the dead one — the site 504'd even though the new container's internal
+    # healthcheck (localhost:3030/api/healthz) still passed. -700 keeps it more
+    # protected than user DB containers but below the backend (-900).
+    mem_reservation: 512m
+    oom_score_adj: -700
     healthcheck:
       # Hits the app's own /api/healthz route — no auth, no backend call.
       test: ["CMD-SHELL", "wget -qO- http://localhost:3030/api/healthz || exit 1"]
