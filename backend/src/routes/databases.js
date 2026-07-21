@@ -406,9 +406,14 @@ router.post('/:id/start', requireAuth, async (req, res, next) => {
 // to the user, points at VPS_HOST:nginx-port) and an internal one (used by the
 // backend's own MongoDB / PG drivers — they run inside the backend container
 // and reach user DBs by container name on customdb-network).
+// userId scopes the lookup to a single owner (normal user-facing calls). Pass
+// null/undefined to skip the owner filter — used ONLY by the admin panel, which
+// is already gated behind requireAdmin, to browse any user's database.
 async function loadDatabaseWithUrl(userId, id) {
+  const where = { id, status: 'active' };
+  if (userId) where.userId = userId;
   const db = await prisma.database.findFirst({
-    where: { id, userId, status: 'active' },
+    where,
     include: { credentials: true },
   });
   if (!db) return null;
@@ -961,3 +966,9 @@ function humanBytes(n) {
 }
 
 module.exports = router;
+// Reused by the admin panel's read-only browse endpoints (routes/admin.js).
+// loadDatabaseWithUrl(null, id) skips the owner filter — safe there because
+// that router is gated behind requireAdmin.
+module.exports.loadDatabaseWithUrl = loadDatabaseWithUrl;
+module.exports.resolveSchema = resolveSchema;
+module.exports.publicShape = publicShape;

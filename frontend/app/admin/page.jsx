@@ -1,9 +1,10 @@
 'use client';
 
 import { useEffect } from 'react';
+import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { useQuery } from '@tanstack/react-query';
-import { Users, Database, HardDrive, Activity } from 'lucide-react';
+import { Users, Database, HardDrive, Activity, ChevronRight } from 'lucide-react';
 import { api } from '@/lib/api';
 import { useAuth, useRequireAuth } from '@/lib/auth';
 import AppShell from '@/components/app/AppShell';
@@ -52,6 +53,7 @@ export default function AdminPage() {
 
   const stats = useQuery({ queryKey: ['admin-stats'], queryFn: api.adminStats, enabled: isAdmin });
   const users = useQuery({ queryKey: ['admin-users'], queryFn: api.adminUsers, enabled: isAdmin });
+  const databases = useQuery({ queryKey: ['admin-databases'], queryFn: () => api.adminListDatabases(), enabled: isAdmin });
 
   return (
     <AppShell>
@@ -120,6 +122,63 @@ export default function AdminPage() {
                       </td>
                     </tr>
                   ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </Card>
+
+        <Card className="mt-6 overflow-hidden">
+          <div className="border-b border-border px-6 py-4">
+            <h2 className="text-md font-medium">Databases</h2>
+            <p className="mt-0.5 text-xs text-text-secondary">Click any database to browse its stored data (read-only).</p>
+          </div>
+          {databases.isLoading ? (
+            <div className="space-y-3 p-6">
+              {Array.from({ length: 5 }).map((_, i) => <Skeleton key={i} className="h-10" />)}
+            </div>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-sm">
+                <thead>
+                  <tr className="border-b border-border text-xs uppercase tracking-wider text-text-muted">
+                    <th className="px-6 py-3 font-medium">Database</th>
+                    <th className="px-6 py-3 font-medium">Owner</th>
+                    <th className="px-6 py-3 font-medium">Type</th>
+                    <th className="px-6 py-3 font-medium">Status</th>
+                    <th className="px-6 py-3 font-medium">Storage</th>
+                    <th className="px-6 py-3 font-medium"></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {(databases.data?.databases || []).map((d) => (
+                    <tr
+                      key={d.id}
+                      onClick={() => router.push(`/admin/databases/${d.id}`)}
+                      className="cursor-pointer border-b border-border last:border-0 hover:bg-bg-inset"
+                    >
+                      <td className="px-6 py-3 font-medium text-text-primary">{d.name}</td>
+                      <td className="px-6 py-3">
+                        <div className="text-text-primary">{d.owner.fullName || '—'}</div>
+                        <div className="text-xs text-text-secondary">{d.owner.email}</div>
+                      </td>
+                      <td className="px-6 py-3">
+                        <Badge variant={d.type === 'sql' ? 'postgres' : 'mongo'}>
+                          {d.type === 'sql' ? 'PostgreSQL' : 'MongoDB'}
+                        </Badge>
+                      </td>
+                      <td className="px-6 py-3">
+                        <Badge variant={d.status === 'active' ? 'success' : 'gray'}>{d.status}</Badge>
+                      </td>
+                      <td className="px-6 py-3 text-text-secondary">{fmtBytes(d.storageUsed)}</td>
+                      <td className="px-6 py-3 text-right">
+                        <ChevronRight className="inline h-4 w-4 text-text-muted" />
+                      </td>
+                    </tr>
+                  ))}
+                  {databases.data && databases.data.databases.length === 0 && (
+                    <tr><td colSpan={6} className="px-6 py-8 text-center text-text-secondary">No databases provisioned yet.</td></tr>
+                  )}
                 </tbody>
               </table>
             </div>

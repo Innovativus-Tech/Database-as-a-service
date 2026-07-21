@@ -61,6 +61,19 @@ export const api = {
 
   adminStats: () => request('/api/admin/stats'),
   adminUsers: () => request('/api/admin/users'),
+  adminListDatabases: (userId) =>
+    request(`/api/admin/databases${userId ? `?userId=${encodeURIComponent(userId)}` : ''}`),
+  adminListSchemas: (id) => request(`/api/admin/databases/${id}/schemas`),
+  adminListCollections: (id, schema) => {
+    const qs = schema ? `?schema=${encodeURIComponent(schema)}` : '';
+    return request(`/api/admin/databases/${id}/collections${qs}`);
+  },
+  adminBrowseCollection: (id, name, { skip = 0, limit = 25, filter, schema } = {}) => {
+    const params = new URLSearchParams({ skip: String(skip), limit: String(limit) });
+    if (filter) params.set('filter', filter);
+    if (schema) params.set('schema', schema);
+    return request(`/api/admin/databases/${id}/collections/${encodeURIComponent(name)}?${params}`);
+  },
 
   getSessions:   () => request('/api/auth/sessions'),
   revokeSession: (id) => request(`/api/auth/sessions/${id}`, { method: 'DELETE' }),

@@ -24,6 +24,14 @@ async function proxy(req, { params }) {
     method,
     headers: proxyHeaders(req),
     cache: 'no-store',
+    // Without this, fetch() follows 3xx responses itself (default
+    // redirect: 'follow') and returns the FINAL destination's body under
+    // our own URL — e.g. the Google OAuth redirect from /api/auth/google
+    // silently fetches accounts.google.com server-side and serves its HTML
+    // back under dbaas.innovativus.tech/api/auth/google, breaking every
+    // relative asset on that page. 'manual' passes the 3xx + Location
+    // header straight through so the browser does the actual navigation.
+    redirect: 'manual',
   };
 
   if (hasBody) {
