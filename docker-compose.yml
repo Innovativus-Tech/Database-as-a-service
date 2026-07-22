@@ -151,12 +151,20 @@ services:
     environment:
       NEXT_PUBLIC_API_URL: ${PUBLIC_API_URL}
       INTERNAL_API_URL: http://backend:4000
-    ports:
-      - "3030:3030"
+    # NOTE: do NOT publish 3030 to the host with `ports:`. The backend (which
+    # never suffers the stale-route 504) does not publish its web port either —
+    # Coolify's Traefik reaches both purely over the `coolify` network. When
+    # the frontend ALSO host-published 3030, a redeploy/restart handed the new
+    # container a fresh internal IP, and Traefik kept routing to the old (now
+    # dead) one → persistent "Gateway Timeout" even though the container was
+    # healthy (proven: direct hit on :3030 returned 200 while the domain 504'd).
+    # `expose` keeps 3030 reachable to Traefik on the network WITHOUT a host
+    # port publish, matching the backend's reliable routing.
+    expose:
+      - "3030"
     networks:
       # Coolify's proxy network = so Traefik can route public dashboard traffic
-      # to the Next.js service. Publishing 3030 is still useful for direct VPS
-      # access, but proxy routing needs shared network reachability.
+      # to the Next.js service over the shared network (no host port needed).
       - coolify
       # Internal app network = so same-origin /api/* requests can be proxied
       # from Next.js to the backend even if the public API domain is down.
