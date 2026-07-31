@@ -21,7 +21,7 @@
 import { useEffect, useRef } from 'react'
 import { usePathname } from 'next/navigation'
 import {
-  BrowserRouter, Routes, Route, Navigate, useNavigate, useLocation,
+  MemoryRouter, Routes, Route, Navigate, useNavigate, useLocation,
 } from 'react-router-dom'
 import { ConnectionsPage } from './pages/Connections'
 import { ExplorePage } from './pages/Explore'
@@ -36,16 +36,13 @@ import { SyncPage } from './pages/Sync'
  * Propagates Next.js navigations into React Router.
  *
  * The dashboard sidebar links with next/link, which performs a client-side
- * navigation via history.pushState. React Router's BrowserRouter only listens
- * for `popstate`, and pushState does not fire it — so a sidebar click changed
- * the URL while the router kept rendering the previous screen. Whether the
- * view updated at all came down to whether Next happened to remount this
- * subtree, which is why navigating between Operate sections felt erratic and
- * sometimes appeared to hang.
+ * navigation via history.pushState. Using BrowserRouter caused Next.js and
+ * React Router to fight over the History API, leading to state tearing where
+ * the UI lagged behind the URL by exactly one click.
  *
- * Only reacts when Next's pathname actually CHANGES. Comparing the two paths
- * on every render would fight React Router's own internal navigations (which
- * Next likewise cannot observe) and ping-pong between them.
+ * Switching to MemoryRouter isolates React Router. Next.js fully owns the
+ * browser URL, and this bridge pushes those URL changes down into the
+ * memory router to update the active page.
  */
 function NextRouteBridge() {
   const nextPath = usePathname()
@@ -59,8 +56,6 @@ function NextRouteBridge() {
 
     const inner = (nextPath ?? '').replace(/^\/operate/, '') || '/'
     if (inner !== location.pathname) navigate(inner, { replace: true })
-    // location.pathname is read, not tracked: this must fire on Next
-    // navigations only, never on React Router's own.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [nextPath, navigate])
 
@@ -68,8 +63,11 @@ function NextRouteBridge() {
 }
 
 export default function OperateApp() {
+  const nextPath = usePathname()
+  const initial = (nextPath ?? '').replace(/^\/operate/, '') || '/'
+
   return (
-    <BrowserRouter basename="/operate">
+    <MemoryRouter initialEntries={[initial]}>
       <NextRouteBridge />
       <Routes>
         <Route path="/" element={<Navigate to="/connections" replace />} />
@@ -82,6 +80,6 @@ export default function OperateApp() {
         <Route path="/migrate" element={<MigratePage />} />
         <Route path="/sync" element={<SyncPage />} />
       </Routes>
-    </BrowserRouter>
+    </MemoryRouter>
   )
 }
