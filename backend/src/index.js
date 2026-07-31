@@ -98,7 +98,24 @@ app.get('/health', async (req, res) => {
 app.use('/api/auth', dashboardCors, require('./routes/auth').router);
 app.use('/api/admin', dashboardCors, require('./routes/admin'));
 app.use('/api/databases', dashboardCors, require('./routes/databases'));
+app.use('/api/settings', dashboardCors, require('./routes/settings'));
 app.use('/api', openCors, require('./routes/cacheConfig'));
+
+// Prometheus scrape target for the monitoring stack. Unauthenticated by
+// design (same as the standalone PivotDB deployment) — it exposes only
+// aggregate gauges, never customer data — and must stay outside the
+// dashboard CORS policy so Prometheus can reach it server-side.
+app.use(require('./routes/metrics'));
+
+// The ported PivotDB API — connections, explore, monitor, migrate, sync,
+// backup/restore, alerts. Mounted under the dashboard CORS policy and behind
+// the same session auth as everything above, so one login covers both halves.
+// `io` is attached later, once the HTTP server exists (see below).
+const pivotRouterHolder = { router: null };
+app.use('/api', dashboardCors, (req, res, next) => {
+  if (!pivotRouterHolder.router) return next();
+  return pivotRouterHolder.router(req, res, next);
+});
 
 app.use((err, req, res, _next) => {
   console.error(err);
@@ -195,6 +212,7 @@ async function bootstrap() {
   const { syncFromDatabaseRows, reloadNginx } = require('./services/nginxManager');
   const { ensureContainerRunning } = require('./services/provisioning');
   const { decrypt } = require('./services/crypto');
+  const { backfillManagedConnections } = require('./services/connectionSync');
   try {
     await ensureAdminUser().catch((err) =>
       console.warn('[admin-seed] failed (will retry next boot):', err.message));
@@ -239,6 +257,19 @@ async function bootstrap() {
       console.log('[bootstrap:bg] container reconciliation complete');
     });
 
+    // Mirror every provisioned database into a managed Connection so the
+    // PivotDB half (Explore, Migrate, Sync, Protect, Monitor, Alerts) can see
+    // it. This is what upgrades databases created before the merge — they get
+    // registered on first boot and need no user action. Idempotent, so it's
+    // also the repair path for a registration that failed at create time.
+    // Backgrounded: it does one probe-free DB write per database and must not
+    // delay the listener.
+    setImmediate(() => {
+      backfillManagedConnections()
+        .then((n) => { if (n > 0) console.log(`[connection-sync] registered ${n} database(s) as connections`); })
+        .catch((err) => console.warn('[connection-sync] backfill failed:', err.message));
+    });
+
     // Redis ACL healer — once now (covers "Redis restarted while backend was
     // down"), then every 10 minutes (covers "Redis restarted while we're up").
     reprovisionAllRedisAcls()
@@ -264,6 +295,60 @@ const server = app.listen(PORT, async () => {
 
   await bootstrap();
 });
+
+// ──────────────────────────────────────────────────────────────────────────────
+// PivotDB half: realtime channel, API surface, and background workers.
+//
+// All of it shares this process, this Express server and the single Prisma
+// client — the merge is an integration, not two apps behind one proxy.
+// ──────────────────────────────────────────────────────────────────────────────
+
+// Socket.IO rides the same HTTP listener. Used for live current-ops streaming
+// (one namespace per connection) and per-run migration progress.
+const { Server: SocketIoServer } = require('socket.io');
+const io = new SocketIoServer(server, {
+  cors: { origin: FRONTEND_ORIGIN || true, credentials: false },
+});
+
+pivotRouterHolder.router = require('./routes/pivot').createPivotRouter(io);
+
+const { registerMonitorSocket } = require('./pivot/routes/monitor.js');
+registerMonitorSocket(io);
+
+// BullMQ workers. Each owns one queue and runs in-process; they need Redis,
+// so a deployment without REDIS_URL simply runs without the job features
+// rather than crash-looping on boot.
+function startPivotWorkers() {
+  if (!process.env.REDIS_URL) {
+    console.warn('[pivot] REDIS_URL not set — migration, sync, backup and export jobs are disabled');
+    return;
+  }
+  try {
+    require('./pivot/jobs/export.job.js').startExportWorker();
+    require('./pivot/jobs/cdc-sync.job.js').startCdcWorker();
+    require('./pivot/jobs/backup.job.js').startBackupWorker();
+    require('./pivot/jobs/restore.job.js').startRestoreWorker();
+
+    // Legacy same-engine Mongo migration — streams its log lines over the
+    // socket so the UI can tail a run.
+    require('./pivot/jobs/migration.job.js').startMigrationWorker(
+      (jobId, phase, line) => { try { io.emit(`migration:log:${jobId}`, { phase, line }); } catch { /* noop */ } },
+      (jobId) => { try { io.emit(`migration:done:${jobId}`, {}); } catch { /* noop */ } },
+    );
+
+    // Cross-engine pipeline (Mongo ↔ Postgres ↔ MySQL), per-run namespaces.
+    require('./pivot/migration/worker.js').startMigrationV2Worker(io);
+
+    // Cron scheduler for backup jobs. Async — reads schedules from the DB.
+    require('./pivot/scheduler/index.js').startScheduler()
+      .catch((err) => console.warn('[pivot] scheduler failed to start:', err.message));
+
+    console.log('[pivot] workers started (export, cdc-sync, backup, restore, migration, migration-v2)');
+  } catch (err) {
+    console.error('[pivot] worker startup failed:', err.message);
+  }
+}
+startPivotWorkers();
 
 const shutdown = async (signal) => {
   console.log(`\n[customdb-backend] ${signal} received, shutting down`);

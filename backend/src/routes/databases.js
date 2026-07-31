@@ -28,6 +28,7 @@ const { FREE_DB_LIMIT } = require('./auth');
 const { addStreamBlock, removeStreamBlock, reloadNginx } = require('../services/nginxManager');
 const { mongoGatewayEnabled, mongoGatewayPort, mongoGatewayHost, isNetworkRouted } = require('../services/mongoGateway');
 const { pgPublicPort } = require('../services/pgGateway');
+const { syncConnectionForDatabase, removeConnectionForDatabase } = require('../services/connectionSync');
 const {
   listMongoDatabases,
   listMongoDatabasesWithPrimary,
@@ -223,6 +224,13 @@ router.post('/create', requireAuth, async (req, res, next) => {
     const connectionUrl = generateConnectionURL(type, {
       host, port: publicPort(updated), username, password, dbName: name, tls: tlsEnabled,
     });
+
+    // Mirror the new database into a managed Connection so every PivotDB
+    // feature (Explore, Migrate, Sync, Protect, Monitor, Alerts) works on it
+    // immediately. Deliberately non-fatal: the database itself is provisioned
+    // and usable, and the boot-time backfill repairs a missed registration.
+    await syncConnectionForDatabase(updated.id).catch((err) =>
+      console.warn(`[connection-sync] auto-register failed for ${name}:`, err.message));
 
     res.status(201).json({
       database: publicShape(updated),
@@ -908,6 +916,15 @@ router.delete('/:id', requireAuth, async (req, res, next) => {
     if (!db) return res.status(404).json({ error: 'Database not found' });
 
     const { containerName, dataDir } = resolveNames(db);
+
+    // Drop the managed Connection mirror first. The Database→Connection
+    // relation is SetNull, not Cascade (a Connection outlives any single
+    // database row by design), so deleting the database alone would strand
+    // the mirror — leaving a dead entry in Explore/Migrate pointing at a
+    // container that no longer exists. This also pauses any CDC syncs that
+    // were tailing it.
+    await removeConnectionForDatabase(db.id).catch((err) =>
+      console.warn(`[connection-sync] failed to unregister ${db.dbName}:`, err.message));
 
     // Cascade removes credentials too. Doing this FIRST means the row is
     // gone from the user's POV before the slow disk work even starts.
