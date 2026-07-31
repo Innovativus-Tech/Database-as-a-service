@@ -23,9 +23,14 @@ export async function sendAlertEmail(
       : undefined,
   });
   await transporter.sendMail({
-    from: process.env.SMTP_FROM ?? process.env.SMTP_USER ?? 'alerts@pivotdb',
+    // MAIL_FROM is the platform-wide sender (used by password-reset mail and
+    // set by docker-compose); SMTP_FROM is PivotDB's original name for the
+    // same thing and is kept first for anyone carrying that env over. Without
+    // the MAIL_FROM fallback, alert mail went out from the raw SMTP_USER
+    // address while every other email used the branded sender.
+    from: process.env.SMTP_FROM ?? process.env.MAIL_FROM ?? process.env.SMTP_USER ?? 'alerts@customdb',
     to,
-    subject: `[PivotDB Alert] ${subject}`,
+    subject: `[CustomDB Alert] ${subject}`,
     text: body,
   });
 }
