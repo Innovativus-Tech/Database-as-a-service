@@ -116,6 +116,22 @@ services:
       # of them, queueing bcrypt.compare from concurrent login attempts.
       # 16 leaves plenty of headroom for auth even mid-cleanup.
       UV_THREADPOOL_SIZE: 16
+      # ── PivotDB half ────────────────────────────────────────────────────
+      # AES-256-GCM key for stored connection URIs (64-char hex). Distinct
+      # from CREDENTIAL_ENC_KEY, which encrypts provisioned-database
+      # passwords. If you are importing an existing PivotDB dataset this MUST
+      # be that deployment's original key, or every imported connection URI
+      # becomes permanently unreadable.
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+      # AES-256-GCM key for backup archives. Without it, backups are written
+      # as plain .tar.gz. Lose it and existing encrypted backups are gone.
+      BACKUP_ENCRYPTION_KEY: ${BACKUP_ENCRYPTION_KEY:-}
+      BACKUP_DIR: /app/backups
+      TEMP_DIR: /tmp/customdb
+      # Timezone cron schedules (backup jobs) are interpreted in.
+      SCHEDULER_TZ: ${SCHEDULER_TZ:-UTC}
+      # Baked into the frontend at build time; also used for Grafana links.
+      GRAFANA_URL: ${GRAFANA_PUBLIC_URL:-http://localhost:3003}
     ports:
       # ALL Postgres databases share this one public port — the backend's
       # pgGateway parses the PG startup message and routes by the globally
@@ -129,6 +145,9 @@ services:
       # straight to the Docker daemon, which interprets it on the host.
       - /data:/data
       - ./nginx/stream.d:/etc/nginx/stream.d
+      # Backup archives produced by the Protect feature (mongodump / pg_dump /
+      # mysqldump, then tar+gzip+AES-GCM). Must be a persistent volume.
+      - backup-data:/app/backups
     networks:
       # Coolify's proxy network = so Traefik can route public traffic to /api/*
       - coolify
@@ -147,9 +166,14 @@ services:
       # the Dockerfile's ARG line picks it up and bakes it into the bundle.
       args:
         NEXT_PUBLIC_API_URL: ${PUBLIC_API_URL}
+        # The Monitor page embeds Grafana in an iframe rendered by the USER'S
+        # browser, so this must be a publicly resolvable URL — not the
+        # internal service name.
+        NEXT_PUBLIC_GRAFANA_URL: ${GRAFANA_PUBLIC_URL:-http://localhost:3003}
     container_name: customdb-frontend
     environment:
       NEXT_PUBLIC_API_URL: ${PUBLIC_API_URL}
+      NEXT_PUBLIC_GRAFANA_URL: ${GRAFANA_PUBLIC_URL:-http://localhost:3003}
       INTERNAL_API_URL: http://backend:4000
     # NOTE: do NOT publish 3030 to the host with `ports:`. The backend (which
     # never suffers the stale-route 504) does not publish its web port either —
@@ -266,9 +290,68 @@ services:
         soft: 65536
         hard: 65536
 
+  # ────────────────────────────────────────────────────────────────────────
+  # Monitoring stack (merged from PivotDB)
+  #
+  # Prometheus scrapes the backend's /metrics endpoint; Grafana renders the
+  # per-engine dashboards the Monitor page embeds. Both are optional — the
+  # rest of the platform runs fine without them, you just lose the charts.
+  # ────────────────────────────────────────────────────────────────────────
+  prometheus:
+    build:
+      context: ./config/prometheus
+      dockerfile: Dockerfile
+    container_name: customdb-prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=${PROMETHEUS_RETENTION:-30d}'
+    volumes:
+      - prometheus-data:/prometheus
+    networks:
+      # Only needs to reach the backend — deliberately NOT on the coolify
+      # proxy network, so the raw metrics endpoint isn't publicly routable.
+      - customdb-network
+    depends_on:
+      - backend
+    restart: unless-stopped
+    mem_limit: 512m
+
+  grafana:
+    build:
+      context: ./config/grafana
+      dockerfile: Dockerfile
+    container_name: customdb-grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_PATHS_PROVISIONING: /etc/grafana/provisioning
+      # The dashboard embeds Grafana panels in an iframe; both are required
+      # or the browser refuses to render them.
+      GF_SECURITY_ALLOW_EMBEDDING: "true"
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_SERVER_ROOT_URL: ${GRAFANA_PUBLIC_URL:-http://localhost:3003}
+    volumes:
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "${GRAFANA_PORT:-3003}:3000"
+    networks:
+      - customdb-network
+      - coolify
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    mem_limit: 512m
+
 volumes:
   meta-db-data:
   redis-data:
+  prometheus-data:
+  grafana-data:
+  # Backup archives written by the Protect feature. CRITICAL — losing this
+  # volume loses every backup taken through the dashboard.
+  backup-data:
 
 networks:
   customdb-network:

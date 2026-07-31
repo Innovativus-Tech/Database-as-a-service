@@ -12,6 +12,10 @@ COPY . .
 # `next build` sees them.
 ARG NEXT_PUBLIC_API_URL
 ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
+# Where the browser loads the embedded Grafana panels from on the Monitor
+# page. Baked in at build time like every other NEXT_PUBLIC_* value.
+ARG NEXT_PUBLIC_GRAFANA_URL
+ENV NEXT_PUBLIC_GRAFANA_URL=$NEXT_PUBLIC_GRAFANA_URL
 ENV NEXT_TELEMETRY_DISABLED=1
 RUN npm run build
 

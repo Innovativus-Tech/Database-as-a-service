@@ -1,10 +1,37 @@
-# CustomDB — Database as a Service
+# CustomDB — Database as a Service + Data Operations Platform
 
 Self-hosted MongoDB + PostgreSQL as a service, in the style of MongoDB Atlas:
 every database you create in the dashboard gets its **own isolated container**,
 its **own credentials**, and a **standard connection string** that works with
 mongosh, Compass, psql, and every official driver — plus an optional SDK
 connection string with transparent Redis caching.
+
+**It also operates databases, not just provisions them.** This repository is
+the merge of two previously separate products — CustomDB (provisioning) and
+PivotDB (operations) — into one application with one login:
+
+| | |
+|---|---|
+| **Provision** | Isolated Mongo/Postgres containers, single-port gateways, per-DB Redis cache users, SDK |
+| **Explore** | Browse schemas, run queries and aggregations, inspect documents and rows |
+| **Migrate** | All 9 cross-engine directions (Mongo ↔ Postgres ↔ MySQL) with schema inference and type translation |
+| **Sync (CDC)** | Continuous replication via PG logical replication, Mongo change streams, MySQL binlog |
+| **Protect** | Scheduled backups with native engine tools, AES-256-GCM archives, one-click restore |
+| **Monitor** | Engine-aware Grafana dashboards, live current-ops, slow queries, replication lag |
+| **Alerts** | Threshold rules with duration debounce, email/webhook notifications |
+
+The two halves are genuinely integrated, not bolted together:
+
+* **One account.** You sign in once, at `/login`. There is no second login,
+  no workspace picker. Sessions, 2FA, Google OAuth and password reset all
+  come from the CustomDB side and cover every feature.
+* **Every provisioned database is automatically a connection.** Create a
+  database and it is immediately available in Explore, Migrate, Sync, Protect,
+  Monitor and Alerts — nothing to copy, paste or re-enter. External
+  Mongo/Postgres/MySQL servers can still be added by hand alongside them.
+* **One process, one database, one deployment.** The operations engine runs
+  inside the backend and shares its Prisma client; the console is served by
+  the same Next.js dashboard under `/operate`.
 
 There are **no plan/tier limits by default** — database count and storage per
 user are unlimited unless you explicitly set `DB_LIMIT` / `STORAGE_LIMIT_GB`.
@@ -112,16 +139,20 @@ network with your own reverse-proxy network.
    | `SMTP_URL` or `SMTP_HOST/PORT/USER/PASS` | Password-reset email. If unset, reset links are printed to backend logs. |
    | `DB_LIMIT`, `STORAGE_LIMIT_GB` | **Optional caps. Empty = unlimited (default).** |
 
-3. **Ports** — only four data-plane ports total, no matter how many
-   databases exist: `3030` (or your proxy) for the dashboard, the API route,
+3. **Ports** — the data plane stays a fixed set no matter how many databases
+   exist: `3030` (or your proxy) for the dashboard, the API route,
    `MONGO_GATEWAY_PORT` (default `27017`) for ALL Mongo databases,
    `PG_PUBLIC_PORT` (default `5433`) for ALL Postgres databases, and `6380`
-   (Redis).
+   (Redis). The merge adds one more: `GRAFANA_PORT` (default `3003`), which
+   the Monitor page embeds in an iframe and therefore must be reachable from
+   the user's browser. Prometheus is deliberately NOT published — it sits on
+   the internal network only.
 4. **Deploy** — `docker compose up -d --build`. The backend runs
    `prisma migrate deploy` on start, reconciles user containers, rewrites
    nginx stream configs, and re-provisions Redis ACLs.
 5. **Backups** — user data lives under `/data/<user>-<db>` on the host, the
-   platform metadata in the `meta-db-data` volume. Snapshot both. (Per-DB
+   platform metadata in the `meta-db-data` volume, and archives created by the
+   Protect feature in the `backup-data` volume. Snapshot all three. (Per-DB
    dumps: `docker exec customdb-mongo-… mongodump`, or use the dashboard's
    import/export.)
 
@@ -150,10 +181,53 @@ level.
 
 | Path | What |
 |---|---|
-| `backend/` | Express API, Prisma schema, provisioning engine (Dockerode), import pipeline (worker threads), nginx config manager |
+| `backend/` | Express API, Prisma schema, provisioning engine (Dockerode), import pipeline, nginx config manager |
+| `backend/src/pivot/` | The ported operations engine: migration pipeline, CDC adapters, backup/restore, engine clients, BullMQ workers, and the routes that expose them |
+| `backend/src/services/profileBridge.js` | The join between the two halves — gives every user a workspace on demand |
+| `backend/src/services/connectionSync.js` | Auto-registers each provisioned database as a connection |
+| `backend/prisma/import/` | Data-preserving importer for an existing PivotDB metadata database |
 | `frontend/` | Next.js 14 dashboard (App Router) |
+| `frontend/components/operate/` | The operations console (React Router SPA), mounted at `/operate` |
 | `nginx/` | TCP stream proxy image + per-DB config dir (`stream.d/`) |
+| `config/` | Prometheus scrape config + provisioned Grafana dashboards (mongo / pg / mysql) |
 | `packages/client/` | `@customdb/client` SDK (Mongo + Postgres wrappers with Redis caching) |
+
+### How the two halves are wired
+
+```
+                  ┌──────────── one Express process (:4000) ────────────┐
+  /api/auth       │  CustomDB    sessions · 2FA · OAuth · reset         │
+  /api/databases  │              provisioning (Dockerode) · gateways    │
+                  │      │                                             │
+                  │      │  User ──1:1──▶ Profile   ◀── the only join   │
+                  │      ▼                    │                        │
+  /api/connections│  Database ──mirrors──▶ Connection                   │
+  /api/migration-v2│ (auto-registered)         │                        │
+  /api/cdc-sync   │  PivotDB engine ◀──────────┘                        │
+  /api/backup     │              BullMQ workers · Socket.IO · /metrics  │
+  /api/alerts     └─────────────────────────────────────────────────────┘
+```
+
+* `Profile` is PivotDB's tenancy unit and stays the scope for every
+  connection, job, rule and query. Each user transparently owns exactly one,
+  created on first use — the concept never surfaces in the UI.
+* A user's own `role` (`user` / `admin`) remains the platform-wide gate;
+  `profileRole` (`admin` / `viewer`) controls read-only teammates invited into
+  a workspace.
+
+### Notes for maintainers
+
+* **The backend is a TypeScript + JavaScript hybrid.** The CustomDB half is
+  CommonJS `.js`; the ported engine is ESM-authored `.ts`. Both compile to
+  CommonJS via `tsconfig.json` (`allowJs`), so they share one module graph and
+  one Prisma client. Run `npm run build`; the entrypoint is `dist/index.js`.
+* **The ported routes still look like Fastify.** `src/pivot/adapter/` is a
+  ~150-line shim presenting the slice of Fastify's API those modules use, on
+  top of an Express Router. This kept ~2,000 lines of working handlers
+  unrewritten and lets upstream PivotDB fixes be pulled across cleanly.
+* **The console is a React Router SPA inside Next.js.** `/operate/[[...slug]]`
+  renders it client-side with `basename="/operate"`, so deep links and history
+  work without rewriting the pages into App Router conventions.
 
 ## Operations notes
 
@@ -169,3 +243,54 @@ level.
 - **Container recovery**: if a user DB container is removed (host reboot,
   manual `docker rm`), the backend recreates it from the surviving data dir on
   boot or via the dashboard's Restart button.
+- **Connection backfill**: on boot the backend mirrors any active database
+  that has no connection yet. This is what upgrades databases created before
+  the merge — they appear in the console automatically, no user action needed.
+  It is idempotent and also repairs a registration that failed at create time.
+- **Two encryption keys, different jobs**: `CREDENTIAL_ENC_KEY` (base64)
+  encrypts provisioned-database passwords; `ENCRYPTION_KEY` (64-char hex)
+  encrypts stored connection URIs; `BACKUP_ENCRYPTION_KEY` (64-char hex)
+  encrypts backup archives. They are not interchangeable, and losing the
+  backup key makes existing encrypted archives unrecoverable.
+- **Jobs need Redis**: migration, sync, backup, restore and export run on
+  BullMQ. Without `REDIS_URL` the backend still starts and everything else
+  works — it logs that those features are disabled rather than crash-looping.
+
+## Migrating existing deployments
+
+Both products' data is preserved.
+
+**CustomDB** needs no import. The merged schema is a strict superset of the
+old one, so `prisma migrate deploy` (which the backend runs on start) adds the
+new tables and columns without touching existing rows. The merge migration
+contains no `DROP` statements.
+
+**PivotDB** lives in a separate physical database, so its rows are copied:
+
+```bash
+cd backend
+PIVOTDB_URL=postgresql://user:pass@old-host:5432/mongovis \
+ENCRYPTION_KEY=<the PivotDB deployment's original key> \
+  npm run import:pivotdb -- --dry-run     # report only, writes nothing
+```
+
+Drop `--dry-run` to apply. The importer:
+
+* copies users, preserving password hashes — PivotDB hashed with `bcryptjs`
+  and this backend verifies with `bcrypt`, and the formats are
+  interchangeable, so everyone keeps their existing password;
+* treats a matching email as the same person, keeping the CustomDB account
+  (which may already own databases, 2FA and Google linkage) and attaching the
+  PivotDB rows to it;
+* recreates each profile as that user's workspace;
+* copies connections, jobs, runs, alert rules, saved queries and audit events
+  with their original ids, so every foreign key stays valid.
+
+It is idempotent — a re-run after a partial failure resumes rather than
+duplicating — and never deletes anything in the destination.
+
+> ⚠ `ENCRYPTION_KEY` **must** be the key that PivotDB deployment used.
+> Connection URIs are copied as ciphertext and never decrypted during import;
+> a different key leaves every imported connection permanently unreadable.
+> The importer verifies the key against a sample row and aborts before writing
+> if it doesn't match.

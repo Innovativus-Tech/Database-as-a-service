@@ -80,6 +80,11 @@ function publicUser(user) {
     organizationName: user.organizationName,
     twoFactorEnabled: user.twoFactorEnabled,
     createdAt: user.createdAt,
+    // Workspace identity for the Operate console. `profileRole` is the
+    // permission WITHIN the workspace ('admin' | 'viewer'), distinct from
+    // `role` above, which is the platform-wide gate.
+    profileRole: user.profileRole,
+    profileId: user.profileId,
   };
 }
 

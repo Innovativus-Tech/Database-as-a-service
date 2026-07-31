@@ -1,17 +1,46 @@
-// CustomDB meta database schema
-// Stores users, their provisioned databases, and per-database credentials.
+// CustomDB unified meta database schema
+//
+// This schema merges two previously separate products:
+//
+//   1. CustomDB (Database-as-a-Service) — users, provisioned database
+//      containers, per-database credentials, sessions/2FA/OAuth. Uses UUID ids.
+//   2. PivotDB — connections to databases, cross-engine migration, CDC sync,
+//      backup/restore, monitoring and alerting. Uses CUID ids.
+//
+// The two halves are joined by exactly one edge: `User 1—1 Profile`.
+//
+//   - `User` is the ONLY identity in the merged product. Everything that used
+//     to authenticate against PivotDB's own user table now authenticates here.
+//   - `Profile` is retained as PivotDB's scoping unit (every Connection, job,
+//     alert and saved query hangs off a Profile). Each User transparently owns
+//     exactly one Profile, created on demand. Users never see the concept —
+//     they sign in once and every PivotDB feature is scoped to them.
+//
+// Id strategies are deliberately NOT unified: each model keeps the id format
+// it had in its origin schema so both existing production datasets can be
+// imported without rewriting foreign keys. See prisma/import/ for the
+// data-preserving import scripts.
 
 generator client {
   provider      = "prisma-client-js"
   // native = local dev (your Mac).
-  // linux-musl-openssl-3.0.x = Alpine 3.18+ on x86_64 (our Dockerfile).
-  binaryTargets = ["native", "linux-musl-openssl-3.0.x"]
+  // debian-openssl-3.0.x = node:20-bookworm-slim, the backend runtime image.
+  //
+  // This was linux-musl-openssl-3.0.x when the backend ran on Alpine. The
+  // image moved to Debian because backup/restore needs mongodump, pg_dump 17
+  // and mysqldump; leaving the musl target here would ship a query engine the
+  // container cannot load.
+  binaryTargets = ["native", "debian-openssl-3.0.x"]
 }
 
 datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Identity & tenancy (CustomDB origin)
+// ─────────────────────────────────────────────────────────────────────────────
 
 enum Plan {
   free
@@ -36,25 +65,74 @@ enum DatabaseStatus {
 }
 
 model User {
-  id               String     @id @default(uuid()) @db.Uuid
-  email            String     @unique
+  id               String   @id @default(uuid()) @db.Uuid
+  email            String   @unique
   passwordHash     String
-  plan             Plan       @default(free)
-  role             Role       @default(user)
-  googleId         String?    @unique
+  plan             Plan     @default(free)
+  // Platform-level gate: `admin` can see every tenant via /api/admin.
+  role             Role     @default(user)
+  googleId         String?  @unique
   displayName      String?
   avatarUrl        String?
   fullName         String?
   organizationName String?
   twoFactorSecret  String?
-  twoFactorEnabled Boolean    @default(false)
-  createdAt        DateTime   @default(now())
+  twoFactorEnabled Boolean  @default(false)
+  createdAt        DateTime @default(now())
 
-  databases Database[]
-  sessions  Session[]
+  // Permission WITHIN the user's own Profile, carried over from PivotDB's
+  // role model: "admin" (full control) | "viewer" (read-only). The owner of a
+  // Profile is always "admin"; invited teammates may be "viewer".
+  // Kept separate from `role` above because that one is platform-wide.
+  profileRole String    @default("admin")
+  // Set when this user was invited into someone else's Profile.
+  invitedBy   String?
+  lastLoginAt DateTime?
+
+  // The PivotDB workspace this user operates in. Every Connection, migration,
+  // sync, backup, alert and saved query is scoped through here.
+  profileId String?  @db.Uuid
+  profile   Profile? @relation("ProfileMembers", fields: [profileId], references: [id])
+
+  // Populated only for the user who owns the Profile (1—1). Teammates invited
+  // into a Profile have `profileId` set but `ownedProfile` null.
+  ownedProfile Profile? @relation("ProfileOwner")
+
+  databases           Database[]
+  sessions            Session[]
   passwordResetTokens PasswordResetToken[]
 
+  @@index([profileId])
   @@map("users")
+}
+
+model Profile {
+  id        String   @id @default(uuid()) @db.Uuid
+  name      String
+  createdAt DateTime @default(now())
+
+  // The single User who owns this workspace. Nullable only so imported
+  // PivotDB profiles can be attached to their matching user in a second pass.
+  ownerUserId String? @unique @db.Uuid
+  owner       User?   @relation("ProfileOwner", fields: [ownerUserId], references: [id], onDelete: Cascade)
+
+  // Legacy PivotDB `Profile.adminId` (a CUID from the old user table). Kept
+  // only so the import can correlate old rows; unused at runtime.
+  legacyAdminId String? @unique
+
+  members         User[]           @relation("ProfileMembers")
+  connections     Connection[]
+  cdcSyncJobs     CdcSyncJob[]
+  backupJobs      BackupJob[]
+  migrationJobs   MigrationJob[]
+  migrationJobsV2 MigrationJobV2[]
+  exportJobs      ExportJob[]
+  alertRules      AlertRule[]
+  alertEvents     AlertEvent[]
+  savedQueries    SavedQuery[]
+  restoreRuns     RestoreRun[]
+
+  @@map("profiles")
 }
 
 model PasswordResetToken {
@@ -88,6 +166,15 @@ model Session {
   @@map("sessions")
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Provisioned databases (CustomDB origin)
+//
+// A Database is a container this platform created and operates. On creation it
+// is auto-registered as a managed `Connection` (see services/connectionSync),
+// which is what makes every PivotDB feature — Explore, Migrate, Sync, Backup,
+// Monitor, Alerts — work against it with zero user setup.
+// ─────────────────────────────────────────────────────────────────────────────
+
 model Database {
   id              String         @id @default(uuid()) @db.Uuid
   userId          String         @db.Uuid
@@ -98,10 +185,16 @@ model Database {
   status          DatabaseStatus @default(provisioning)
   storageUsed     BigInt         @default(0)
   containerName   String?        @unique
-  routing         String?        // null = legacy direct port binding; "nginx" = via nginx proxy
+  routing         String? // null = legacy direct port binding; "nginx" = via nginx proxy
   tlsEnabled      Boolean        @default(false) // existing rows stay plaintext; new rows pass true explicitly
   createdAt       DateTime       @default(now())
   lastConnectedAt DateTime?
+
+  // The managed Connection mirroring this database. Created alongside the
+  // container and deleted with it. Null only for rows provisioned before the
+  // merge, until the backfill on boot catches them.
+  connectionId String?     @unique
+  connection   Connection? @relation("ProvisionedConnection", fields: [connectionId], references: [id], onDelete: SetNull)
 
   user        User         @relation(fields: [userId], references: [id], onDelete: Cascade)
   credentials Credential[]
@@ -112,8 +205,8 @@ model Database {
 }
 
 model Credential {
-  id                String   @id @default(uuid()) @db.Uuid
-  databaseId        String   @db.Uuid
+  id                String @id @default(uuid()) @db.Uuid
+  databaseId        String @db.Uuid
   username          String
   passwordEncrypted String
 
@@ -121,4 +214,454 @@ model Credential {
 
   @@index([databaseId])
   @@map("credentials")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Connections & operations (PivotDB origin)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Connection {
+  id           String   @id @default(cuid())
+  name         String
+  encryptedUri String
+  // dbType: which engine this connection points at. Drives client + discovery.
+  // Allowed values: "mongodb" | "postgres" | "mysql". Supabase = "postgres".
+  dbType       String   @default("mongodb")
+  // topology: Mongo-only ("standalone" | "replicaSet" | "sharded").
+  // For SQL connections this stays "standalone".
+  topology     String
+  // metadata: per-type extras (SSL CA, PG schema name, MySQL charset, etc.)
+  metadata     Json?
+  // dbVersion: server version cached at last successful test.
+  dbVersion    String?
+  tags         String[]
+  readOnly     Boolean  @default(false)
+  createdBy    String
+  profileId    String   @db.Uuid
+  profile      Profile  @relation(fields: [profileId], references: [id])
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  // True when this row mirrors a database THIS platform provisioned. Managed
+  // connections have their URI maintained by the provisioning engine — the UI
+  // blocks editing/deleting them directly (delete the database instead).
+  managed Boolean @default(false)
+
+  provisionedDatabase Database? @relation("ProvisionedConnection")
+
+  backupJobs            BackupJob[]
+  exportJobs            ExportJob[]
+  alertRules            AlertRule[]
+  savedQueries          SavedQuery[]
+  migrationJobsSource   MigrationJob[]   @relation("MigrationSource")
+  migrationJobsDest     MigrationJob[]   @relation("MigrationDest")
+  migrationJobsV2Source MigrationJobV2[] @relation("MigrationV2Source")
+  migrationJobsV2Dest   MigrationJobV2[] @relation("MigrationV2Dest")
+  cdcSyncJobsSource     CdcSyncJob[]     @relation("CdcSyncSource")
+  cdcSyncJobsDest       CdcSyncJob[]     @relation("CdcSyncDest")
+  restoreRuns           RestoreRun[]     @relation("RestoreTargetConnection")
+
+  @@index([profileId])
+  @@map("connections")
+}
+
+model BackupJob {
+  id            String     @id @default(cuid())
+  profileId     String     @db.Uuid
+  profile       Profile    @relation(fields: [profileId], references: [id], onDelete: Cascade)
+  connectionId  String
+  connection    Connection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+  name          String
+  databases     String[]   @default([])
+  schedule      String
+  retentionDays Int        @default(30)
+  status        String     @default("active")
+  lastRunAt     DateTime?
+  lastRunStatus String?
+  lastRunError  String?
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @updatedAt
+
+  runs BackupRun[]
+
+  @@map("backup_jobs")
+}
+
+model BackupRun {
+  id         String    @id @default(cuid())
+  jobId      String
+  job        BackupJob @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  status     String
+  startedAt  DateTime  @default(now())
+  finishedAt DateTime?
+  sizeBytes  BigInt?
+  filePath   String?
+  databases  String[]  @default([])
+  errorMsg   String?
+
+  restoreRuns RestoreRun[]
+
+  @@map("backup_runs")
+}
+
+model RestoreRun {
+  id                 String     @id @default(cuid())
+  backupRunId        String
+  backupRun          BackupRun  @relation(fields: [backupRunId], references: [id], onDelete: Cascade)
+  targetConnectionId String
+  targetConnection   Connection @relation("RestoreTargetConnection", fields: [targetConnectionId], references: [id], onDelete: Cascade)
+  profileId          String     @db.Uuid
+  profile            Profile    @relation(fields: [profileId], references: [id], onDelete: Cascade)
+  status             String     @default("queued") // queued | running | success | failed
+  startedAt          DateTime?
+  finishedAt         DateTime?
+  log                String?
+  createdAt          DateTime   @default(now())
+
+  @@map("restore_runs")
+}
+
+model ExportJob {
+  id           String     @id @default(cuid())
+  connectionId String
+  connection   Connection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+  profileId    String     @db.Uuid
+  profile      Profile    @relation(fields: [profileId], references: [id])
+  exportType   String     @default("collection")
+  database     String
+  collection   String?
+  query        Json
+  isPipeline   Boolean    @default(false)
+  format       String
+  options      Json
+  destination  String?
+  status       String     @default("pending")
+  fileKey      String?
+  createdAt    DateTime   @default(now())
+
+  runs JobRun[]
+
+  @@map("export_jobs")
+}
+
+model MigrationJob {
+  id           String     @id @default(cuid())
+  name         String
+  sourceConnId String
+  source       Connection @relation("MigrationSource", fields: [sourceConnId], references: [id], onDelete: Cascade)
+  destConnId   String
+  destination  Connection @relation("MigrationDest", fields: [destConnId], references: [id], onDelete: Cascade)
+  profileId    String     @db.Uuid
+  profile      Profile    @relation(fields: [profileId], references: [id])
+  scope        Json
+  options      Json
+  status       String     @default("pending")
+  tempDirPath  String?
+  createdBy    String
+  createdAt    DateTime   @default(now())
+
+  runs MigrationRun[]
+
+  @@map("migration_jobs")
+}
+
+model MigrationRun {
+  id            String       @id @default(cuid())
+  jobId         String
+  job           MigrationJob @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  startedAt     DateTime     @default(now())
+  finishedAt    DateTime?
+  status        String
+  phase         String?
+  dumpSizeBytes Int?
+  counts        Json?
+  errorReport   Json?
+  logLines      String[]
+
+  @@map("migration_runs")
+}
+
+model JobRun {
+  id          String    @id @default(cuid())
+  jobType     String
+  startedAt   DateTime  @default(now())
+  finishedAt  DateTime?
+  status      String
+  counts      Json?
+  errorReport Json?
+
+  exportJobId String?
+  exportJob   ExportJob? @relation(fields: [exportJobId], references: [id])
+
+  @@map("job_runs")
+}
+
+model AlertRule {
+  id              String     @id @default(cuid())
+  profileId       String     @db.Uuid
+  profile         Profile    @relation(fields: [profileId], references: [id], onDelete: Cascade)
+  connectionId    String
+  connection      Connection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+  name            String
+  metric          String // currentConnections | availableConnections | memResident | memVirtual | opsPerSecTotal | replicationLag | wtCachePercent | networkBytesIn | networkBytesOut
+  condition       String // gt | lt | gte | lte
+  threshold       Float
+  durationMinutes Int        @default(1)
+  enabled         Boolean    @default(true)
+  notifyEmail     String?
+  notifyWebhook   String?
+  status          String     @default("ok") // ok | firing | paused
+  firingStartedAt DateTime?
+  lastEvaluatedAt DateTime?
+  lastNotifiedAt  DateTime?
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+
+  events AlertEvent[]
+
+  @@map("alert_rules")
+}
+
+model AlertEvent {
+  id             String    @id @default(cuid())
+  ruleId         String
+  rule           AlertRule @relation(fields: [ruleId], references: [id], onDelete: Cascade)
+  profileId      String    @db.Uuid
+  profile        Profile   @relation(fields: [profileId], references: [id], onDelete: Cascade)
+  connectionId   String
+  metric         String
+  value          Float
+  threshold      Float
+  condition      String
+  status         String    @default("firing") // firing | resolved | acknowledged
+  firedAt        DateTime  @default(now())
+  resolvedAt     DateTime?
+  acknowledgedAt DateTime?
+  acknowledgedBy String?
+  note           String?
+  notified       Boolean   @default(false)
+
+  @@map("alert_events")
+}
+
+model SavedQuery {
+  id           String     @id @default(cuid())
+  connectionId String
+  connection   Connection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+  profileId    String     @db.Uuid
+  profile      Profile    @relation(fields: [profileId], references: [id])
+  name         String
+  database     String
+  collection   String
+  query        Json
+  isPipeline   Boolean    @default(false)
+  createdAt    DateTime   @default(now())
+
+  @@map("saved_queries")
+}
+
+model AuditEvent {
+  id        String   @id @default(cuid())
+  actor     String
+  action    String
+  target    String
+  timestamp DateTime @default(now())
+  metadata  Json?
+
+  @@map("audit_events")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Cross-engine migration
+//
+// MigrationJobV2 / MigrationRunV2 are intentionally separate from the legacy
+// MigrationJob / MigrationRun rows: the legacy flow shells out to mongodump+
+// mongorestore (same-engine Mongo→Mongo only) and we keep it around because
+// it preserves indexes natively and is faster than our streamed pipeline.
+// V2 is the schemaless cross-engine pipeline in src/pivot/migration/.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model MigrationJobV2 {
+  id        String  @id @default(cuid())
+  name      String
+  profileId String  @db.Uuid
+  profile   Profile @relation(fields: [profileId], references: [id], onDelete: Cascade)
+
+  sourceConnId String
+  source       Connection @relation("MigrationV2Source", fields: [sourceConnId], references: [id], onDelete: Cascade)
+  destConnId   String
+  destination  Connection @relation("MigrationV2Dest", fields: [destConnId], references: [id], onDelete: Cascade)
+
+  // Cached from the connections so the worker doesn't need to JOIN on every batch
+  sourceType String // "mongodb" | "postgres" | "mysql"
+  destType   String
+
+  // Optional scoping. For Mongo this is the database name; for SQL it's the schema name.
+  sourceDatabase String?
+  // When migrating into Mongo we can pin every collection into ONE database
+  // regardless of source schema. For SQL targets this is the schema name.
+  destDatabase   String?
+
+  // Per-namespace overrides (rename, include/exclude, type casts, embed-vs-ref).
+  // Shape defined in src/pivot/migration/job-config.ts.
+  schemaMapping    Json?
+  // Global rules: nullHandling, embedDefaults, decimalHandling, etc.
+  typeMappingRules Json?
+
+  sampleSize         Int     @default(1000)
+  batchSize          Int     @default(1000)
+  parallelism        Int     @default(1)
+  dropExisting       Boolean @default(false)
+  failOnTypeConflict Boolean @default(false)
+
+  createdBy String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  runs MigrationRunV2[]
+
+  @@map("migration_jobs_v2")
+}
+
+model MigrationRunV2 {
+  id        String         @id @default(cuid())
+  jobId     String
+  job       MigrationJobV2 @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  profileId String         @db.Uuid
+
+  /// queued | running | succeeded | partial | failed | cancelled
+  phase           String  @default("queued")
+  /// True iff a user requested cancellation; the worker checks between batches.
+  cancelRequested Boolean @default(false)
+  /// True iff this run was a dry-run (inference + warnings only, no writes).
+  dryRun          Boolean @default(false)
+
+  startedAt  DateTime?
+  finishedAt DateTime?
+
+  // Roll-up counts. Int (not BigInt) — 2B rows/migration is a generous ceiling
+  // and avoids Prisma's BigInt JSON serialisation pitfalls.
+  totalNamespaces Int @default(0)
+  succeededNs     Int @default(0)
+  failedNs        Int @default(0)
+  totalWritten    Int @default(0)
+  totalSkipped    Int @default(0)
+  totalFailed     Int @default(0)
+
+  /// Per-namespace last-known state: { "<db>.<table>": { phase, written, … } }
+  progress   Json?
+  /// Warnings emitted by inference + per-row mapping (capped).
+  warnings   Json?
+  /// Per-namespace fatal errors.
+  errors     Json?
+  /// Generated DDL preview (Mongo→SQL only). Stored after the inference phase.
+  ddlPreview String?
+
+  createdAt DateTime @default(now())
+
+  @@map("migration_runs_v2")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Cross-engine CDC sync
+//
+// CdcSyncJob is a long-running, resumable, source→dest continuous replica.
+// Distinct from MigrationJobV2 (one-shot bounded copy). The worker holds a
+// single BullMQ "active" job per CdcSyncJob row for as long as `enabled` is
+// true, and persists `cursor` after every applied batch so a worker crash
+// resumes near the last successful event.
+//
+// `cursor` shape is engine-specific and opaque to everything except the
+// matching CdcSource adapter:
+//   - Mongo:    { tokens: { "<db>.<coll>": <resumeToken> } }
+//   - Postgres: { lsn: "<LSN>", slot: "<slot_name>" }
+//   - MySQL:    { file: "mysql-bin.000123", pos: 4242, gtid?: "…" }
+// ─────────────────────────────────────────────────────────────────────────────
+
+model CdcSyncJob {
+  id        String  @id @default(cuid())
+  name      String
+  profileId String  @db.Uuid
+  profile   Profile @relation(fields: [profileId], references: [id], onDelete: Cascade)
+
+  sourceConnId String
+  source       Connection @relation("CdcSyncSource", fields: [sourceConnId], references: [id], onDelete: Cascade)
+  destConnId   String
+  destination  Connection @relation("CdcSyncDest", fields: [destConnId], references: [id], onDelete: Cascade)
+
+  // Cached engine types so the worker can route without joining.
+  sourceType String // "mongodb" | "postgres" | "mysql"
+  destType   String
+
+  sourceDatabase String?
+  destDatabase   String?
+
+  // Subset of namespaces to replicate. Shape: [{ database, name }, ...]
+  // Empty/null = all non-system namespaces.
+  namespaces Json?
+
+  // Reused from MigrationJobV2 — same shape so existing UI can edit it.
+  schemaMapping    Json?
+  typeMappingRules Json?
+
+  // Bootstrap mode for first start:
+  //   "snapshot" — full Migrate-style copy, then tail from pre-snapshot cursor
+  //   "tail"     — assume dest is populated; tail from "now"
+  bootstrap String @default("snapshot")
+
+  // Tracks whether the initial snapshot copy has fully completed.
+  //   "pending" — startCursor may be saved, but runMigration has not yet
+  //               returned cleanly. Worker must (re-)run the snapshot.
+  //   "done"    — snapshot finished without per-namespace errors; safe to
+  //               skip the bootstrap block and go straight to tailing.
+  // Decoupled from `cursor` because the cursor is persisted BEFORE the
+  // snapshot starts (so the tail picks up gap events) — without this flag a
+  // mid-snapshot crash would look indistinguishable from a completed bootstrap
+  // and we'd silently drop the rest of the copy.
+  snapshotState String @default("pending")
+
+  // Engine-specific resume position. Opaque JSON owned by the matching adapter.
+  cursor Json?
+
+  // queued | bootstrapping | tailing | paused | failed
+  status         String    @default("queued")
+  lastEventAt    DateTime?
+  lastError      String?
+  /// Set true to ask the worker to pause at the next safe checkpoint.
+  pauseRequested Boolean   @default(false)
+  enabled        Boolean   @default(true)
+
+  createdBy String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  runs CdcSyncRun[]
+
+  @@map("cdc_sync_jobs")
+}
+
+model CdcSyncRun {
+  id        String     @id @default(cuid())
+  jobId     String
+  job       CdcSyncJob @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  profileId String     @db.Uuid
+
+  /// bootstrapping | tailing | paused | failed | stopped
+  phase String @default("bootstrapping")
+
+  startedAt  DateTime  @default(now())
+  finishedAt DateTime?
+
+  // Rolling counts for THIS run (resets each time the worker restarts).
+  inserts     Int @default(0)
+  updates     Int @default(0)
+  deletes     Int @default(0)
+  errorsCount Int @default(0)
+
+  /// Optional last error message captured during this run.
+  lastError String?
+  /// Per-namespace last-known cursor when the run ended (for debugging).
+  endCursor Json?
+
+  @@map("cdc_sync_runs")
 }

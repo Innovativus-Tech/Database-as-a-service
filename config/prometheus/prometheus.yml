@@ -1,0 +1,19 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # The merged backend exposes /metrics on port 4000. PivotDB's standalone API
+  # served it on api:3001 — that service no longer exists, because the
+  # migrate/sync/backup/monitor engine now runs inside the CustomDB backend
+  # process rather than as a separate deployment.
+  #
+  # Keep exactly ONE target here. Adding `host.docker.internal:4000` alongside
+  # it for local development makes both entries resolve to the same instance in
+  # production, and every metric gets counted twice in every Grafana panel.
+  # Override this file with a bind mount for local dev instead.
+  - job_name: 'customdb-backend'
+    static_configs:
+      - targets:
+          - 'backend:4000'
+    metrics_path: '/metrics'
