@@ -9,7 +9,10 @@ export const metadata = {
 
 export default function RootLayout({ children }) {
   return (
-    <html lang="en" className={`${inter.variable} ${jetbrainsMono.variable}`}>
+    // `dark` activates the Operate console's dark token set (see globals.css).
+    // The dashboard itself is dark-only, so this is unconditional rather than
+    // a user-toggled theme.
+    <html lang="en" className={`dark ${inter.variable} ${jetbrainsMono.variable}`}>
       <body>
         <Providers>{children}</Providers>
       </body>

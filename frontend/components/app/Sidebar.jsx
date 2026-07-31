@@ -13,10 +13,23 @@ import {
   Cog,
   LogOut,
   ShieldCheck,
+  Search,
+  BarChart3,
+  ArrowLeftRight,
+  GitMerge,
+  Zap,
+  Shield,
 } from 'lucide-react';
 import { useAuth } from '@/lib/auth';
 import { cn } from '@/lib/cn';
 
+// One navigation across the whole product.
+//
+// "Databases" is CustomDB: databases this platform provisions and runs.
+// "Operate" and "Governance" are the PivotDB console (mounted at /operate),
+// which works on those same databases — every provisioned database is
+// auto-registered as a connection — plus any external Mongo/Postgres/MySQL
+// the user adds themselves.
 const sections = [
   {
     label: 'Databases',
@@ -25,14 +38,26 @@ const sections = [
       { href: '/databases',  label: 'My Databases',  icon: Database },
       { href: '/browse',     label: 'Browse Data',   icon: Table2 },
       { href: '/import',     label: 'Import Data',   icon: Upload },
+      { href: '/connections', label: 'Connection Strings', icon: Cog },
     ],
   },
   {
-    label: 'Settings',
+    label: 'Operate',
     items: [
-      { href: '/connections', label: 'Connection Strings', icon: Link2 },
-      { href: '/usage',       label: 'Usage & Stats',      icon: Activity },
-      { href: '/settings',    label: 'Settings',           icon: Settings },
+      { href: '/operate/connections', label: 'Connections', icon: Link2 },
+      { href: '/operate/explore',     label: 'Explore',     icon: Search },
+      { href: '/operate/monitor',     label: 'Monitor',     icon: BarChart3 },
+      { href: '/operate/move',        label: 'Move',        icon: ArrowLeftRight },
+      { href: '/operate/migrate',     label: 'Migrate',     icon: GitMerge },
+      { href: '/operate/sync',        label: 'Sync',        icon: Zap },
+    ],
+  },
+  {
+    label: 'Governance',
+    items: [
+      { href: '/operate/protect', label: 'Backup & Restore', icon: Shield },
+      { href: '/usage',           label: 'Usage & Stats',    icon: Activity },
+      { href: '/settings',        label: 'Settings',         icon: Settings },
     ],
   },
 ];
