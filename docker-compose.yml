@@ -334,8 +334,16 @@ services:
       GF_SERVER_ROOT_URL: ${GRAFANA_PUBLIC_URL:-http://localhost:3003}
     volumes:
       - grafana-data:/var/lib/grafana
-    ports:
-      - "${GRAFANA_PORT:-3003}:3000"
+    # NOTE: `expose`, NOT `ports` — same reasoning as the frontend service
+    # above. Host-publishing this port did two bad things: it collided with
+    # anything already bound to 3003 on the host (which failed the whole
+    # `docker compose up`, leaving Traefik pointed at dead containers and the
+    # dashboard serving 504s), and it re-introduced the stale-route problem
+    # the frontend was explicitly fixed for. Traefik reaches Grafana over the
+    # `coolify` network — assign it a domain in Coolify and set
+    # GRAFANA_PUBLIC_URL to match.
+    expose:
+      - "3000"
     networks:
       - customdb-network
       - coolify

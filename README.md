@@ -143,10 +143,11 @@ network with your own reverse-proxy network.
    exist: `3030` (or your proxy) for the dashboard, the API route,
    `MONGO_GATEWAY_PORT` (default `27017`) for ALL Mongo databases,
    `PG_PUBLIC_PORT` (default `5433`) for ALL Postgres databases, and `6380`
-   (Redis). The merge adds one more: `GRAFANA_PORT` (default `3003`), which
-   the Monitor page embeds in an iframe and therefore must be reachable from
-   the user's browser. Prometheus is deliberately NOT published — it sits on
-   the internal network only.
+   (Redis). Grafana and Prometheus add no host ports at all: Prometheus is
+   internal-only, and Grafana is routed through the reverse proxy like the
+   dashboard and API (give it a domain and point `GRAFANA_PUBLIC_URL` at it —
+   the Monitor page embeds it in an iframe, so it must resolve from the
+   user's browser).
 4. **Deploy** — `docker compose up -d --build`. The backend runs
    `prisma migrate deploy` on start, reconciles user containers, rewrites
    nginx stream configs, and re-provisions Redis ACLs.
