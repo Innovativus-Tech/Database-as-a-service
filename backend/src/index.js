@@ -210,7 +210,7 @@ async function ensureAdminUser() {
 async function bootstrap() {
   const { ensureNetwork } = require('./services/dockerNetwork');
   const { syncFromDatabaseRows, reloadNginx } = require('./services/nginxManager');
-  const { ensureContainerRunning } = require('./services/provisioning');
+  const { ensureContainerRunning, ensureMongoMonitorRole } = require('./services/provisioning');
   const { decrypt } = require('./services/crypto');
   const { backfillManagedConnections } = require('./services/connectionSync');
   try {
@@ -250,6 +250,21 @@ async function bootstrap() {
           const password = decrypt(cred.passwordEncrypted);
           const action = await ensureContainerRunning({ db, username: cred.username, password });
           if (action !== 'running') console.log(`[bootstrap:bg] ${db.dbName}: container ${action}`);
+
+          // Databases provisioned before the PivotDB merge lack the
+          // clusterMonitor role, so the Monitor page fails against them with
+          // "not authorized on admin to execute command { serverStatus: 1 }".
+          // The user-creation init script only runs on a fresh data dir, so
+          // existing databases have to be repaired in place. Idempotent and
+          // best-effort — a failure here must never block reconciliation.
+          if (db.type === 'nosql') {
+            try {
+              const granted = await ensureMongoMonitorRole(db, cred.username);
+              if (granted === 'granted') console.log(`[bootstrap:bg] ${db.dbName}: granted clusterMonitor`);
+            } catch (err) {
+              console.warn(`[bootstrap:bg] ${db.dbName}: clusterMonitor grant failed:`, err.message);
+            }
+          }
         } catch (err) {
           console.error(`[bootstrap:bg] failed to reconcile ${db.dbName}:`, err.message);
         }

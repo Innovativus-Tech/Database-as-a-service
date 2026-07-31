@@ -151,6 +151,13 @@ async function createMongoContainer({ userId, dbName, port, username, password, 
     `  roles: [`,
     `    { role: 'readWriteAnyDatabase', db: 'admin' },`,
     `    { role: 'dbAdminAnyDatabase', db: 'admin' },`,
+    // clusterMonitor is what makes the Monitor page work against this
+    // database. serverStatus / replSetGetStatus / currentOp / listDatabases
+    // are all cluster-level reads that the two roles above do NOT grant —
+    // without this the dashboard shows "not authorized on admin to execute
+    // command { serverStatus: 1 }". It is a read-only monitoring role: no
+    // write access, no user administration, no shutdown.
+    `    { role: 'clusterMonitor', db: 'admin' },`,
     `  ],`,
     `});`,
   ].join('\n'));
@@ -395,9 +402,71 @@ async function removeDataDir(dir) {
   await fs.promises.rm(resolved, { recursive: true, force: true });
 }
 
+/**
+ * Grant `clusterMonitor` to an existing Mongo database's customer user.
+ *
+ * Databases provisioned before the PivotDB merge were created with only
+ * readWriteAnyDatabase + dbAdminAnyDatabase, because CustomDB had no
+ * monitoring feature and never needed cluster-level reads. The Monitor page
+ * calls serverStatus/replSetGetStatus/currentOp/listDatabases, all of which
+ * require clusterMonitor — so on those older databases it fails with
+ * "not authorized on admin to execute command { serverStatus: 1 }".
+ *
+ * The init script that creates the user only runs once, on a FRESH data dir,
+ * so new-database fixes don't reach existing ones. This repairs them in place.
+ *
+ * The customer user can't grant itself a role (that needs userAdmin, which it
+ * deliberately doesn't have), so we authenticate as the bootstrap root
+ * credential. It was never stored anywhere, but it does still live in the
+ * container's own Env — which is where we read it back from.
+ *
+ * Idempotent: grantRolesToUser is a no-op when the role is already held.
+ *
+ * @param {{containerName: string}} db
+ * @param {string} username customer-facing user to grant the role to
+ * @returns {Promise<'granted'|'skipped'>}
+ */
+async function ensureMongoMonitorRole(db, username) {
+  if (!db.containerName) return 'skipped';
+
+  const info = await docker.getContainer(db.containerName).inspect();
+  if (!info?.State?.Running) return 'skipped';
+
+  const env = Object.fromEntries(
+    (info.Config?.Env || []).map((e) => {
+      const i = e.indexOf('=');
+      return [e.slice(0, i), e.slice(i + 1)];
+    })
+  );
+  const rootUser = env.MONGO_INITDB_ROOT_USERNAME;
+  const rootPass = env.MONGO_INITDB_ROOT_PASSWORD;
+  // Containers created outside our provisioning path won't have these.
+  if (!rootUser || !rootPass) return 'skipped';
+
+  const { MongoClient } = require('mongodb');
+  const uri = `mongodb://${encodeURIComponent(rootUser)}:${encodeURIComponent(rootPass)}`
+    + `@${db.containerName}:27017/?authSource=admin`;
+
+  const client = new MongoClient(uri, {
+    serverSelectionTimeoutMS: 5000,
+    connectTimeoutMS: 5000,
+  });
+  try {
+    await client.connect();
+    await client.db('admin').command({
+      grantRolesToUser: username,
+      roles: [{ role: 'clusterMonitor', db: 'admin' }],
+    });
+    return 'granted';
+  } finally {
+    await client.close().catch(() => {});
+  }
+}
+
 module.exports = {
   createMongoContainer,
   createPostgresContainer,
+  ensureMongoMonitorRole,
   stopAndRemoveContainer,
   inspectContainer,
   startContainer,
