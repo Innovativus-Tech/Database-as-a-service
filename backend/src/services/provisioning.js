@@ -7,6 +7,8 @@ const { randomToken } = require('./crypto');
 const docker = new Docker({ socketPath: process.env.DOCKER_SOCKET || '/var/run/docker.sock' });
 
 const MONGO_IMAGE = 'mongo:7.0';
+// Custom Mongo role carrying just the `killop` action — see createMongoContainer.
+const KILLOP_ROLE = 'customdbKillOp';
 const POSTGRES_IMAGE = 'postgres:16';
 
 function dataRoot() {
@@ -145,6 +147,16 @@ async function createMongoContainer({ userId, dbName, port, username, password, 
   // ?authSource=admin every connection string uses).
   const initFile = path.join(initScriptDir(), `${name}.js`);
   await fs.promises.writeFile(initFile, [
+    // Narrow custom role granting ONLY killop. The built-in role that confers
+    // it is hostManager, which also grants shutdown/setParameter/unlock —
+    // far more authority than "cancel a runaway query on my own database"
+    // warrants. This keeps the Monitor page's kill button working without
+    // handing out the ability to stop the server.
+    `db.getSiblingDB('admin').createRole({`,
+    `  role: '${KILLOP_ROLE}',`,
+    `  privileges: [{ resource: { cluster: true }, actions: ['killop'] }],`,
+    `  roles: [],`,
+    `});`,
     `db.getSiblingDB('admin').createUser({`,
     `  user: '${username}',`,
     `  pwd: '${password}',`,
@@ -158,6 +170,7 @@ async function createMongoContainer({ userId, dbName, port, username, password, 
     // command { serverStatus: 1 }". It is a read-only monitoring role: no
     // write access, no user administration, no shutdown.
     `    { role: 'clusterMonitor', db: 'admin' },`,
+    `    { role: '${KILLOP_ROLE}', db: 'admin' },`,
     `  ],`,
     `});`,
   ].join('\n'));
@@ -453,9 +466,29 @@ async function ensureMongoMonitorRole(db, username) {
   });
   try {
     await client.connect();
-    await client.db('admin').command({
+    const admin = client.db('admin');
+
+    // Create the killop role if this database predates it. Mongo raises
+    // "Role already exists" (code 51002) on repeat calls — that is the
+    // expected steady state, not a failure.
+    try {
+      await admin.command({
+        createRole: KILLOP_ROLE,
+        privileges: [{ resource: { cluster: true }, actions: ['killop'] }],
+        roles: [],
+      });
+    } catch (err) {
+      const code = err?.code;
+      const already = code === 51002 || /already exists/i.test(err?.message || '');
+      if (!already) throw err;
+    }
+
+    await admin.command({
       grantRolesToUser: username,
-      roles: [{ role: 'clusterMonitor', db: 'admin' }],
+      roles: [
+        { role: 'clusterMonitor', db: 'admin' },
+        { role: KILLOP_ROLE, db: 'admin' },
+      ],
     });
     return 'granted';
   } finally {

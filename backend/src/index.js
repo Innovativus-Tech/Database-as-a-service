@@ -149,9 +149,9 @@ async function reprovisionAllRedisAcls() {
 // Mongo databases provisioned before the PivotDB merge were created with only
 // readWriteAnyDatabase + dbAdminAnyDatabase — CustomDB had no monitoring
 // feature, so cluster-level reads were never needed. The Monitor page calls
-// serverStatus/replSetGetStatus/currentOp/listDatabases, all of which require
-// clusterMonitor, so on those databases it fails with "not authorized on admin
-// to execute command { serverStatus: 1 }".
+// serverStatus/replSetGetStatus/currentOp/listDatabases (clusterMonitor) and
+// killOp (a narrow custom role), so on those databases it fails with
+// "not authorized on admin to execute command { serverStatus: 1 }".
 //
 // The user-creation init script only runs on a FRESH data dir, so new-database
 // fixes never reach existing ones — they have to be repaired in place.
@@ -373,26 +373,30 @@ registerMonitorSocket(io);
 // BullMQ workers. Each owns one queue and runs in-process; they need Redis,
 // so a deployment without REDIS_URL simply runs without the job features
 // rather than crash-looping on boot.
+// Handles on every started BullMQ worker, so shutdown can close them cleanly
+// rather than having the process killed out from under a running migration.
+const pivotWorkers = [];
+
 function startPivotWorkers() {
   if (!process.env.REDIS_URL) {
     console.warn('[pivot] REDIS_URL not set — migration, sync, backup and export jobs are disabled');
     return;
   }
   try {
-    require('./pivot/jobs/export.job.js').startExportWorker();
-    require('./pivot/jobs/cdc-sync.job.js').startCdcWorker();
-    require('./pivot/jobs/backup.job.js').startBackupWorker();
-    require('./pivot/jobs/restore.job.js').startRestoreWorker();
+    pivotWorkers.push(require('./pivot/jobs/export.job.js').startExportWorker());
+    pivotWorkers.push(require('./pivot/jobs/cdc-sync.job.js').startCdcWorker());
+    pivotWorkers.push(require('./pivot/jobs/backup.job.js').startBackupWorker());
+    pivotWorkers.push(require('./pivot/jobs/restore.job.js').startRestoreWorker());
 
     // Legacy same-engine Mongo migration — streams its log lines over the
     // socket so the UI can tail a run.
-    require('./pivot/jobs/migration.job.js').startMigrationWorker(
+    pivotWorkers.push(require('./pivot/jobs/migration.job.js').startMigrationWorker(
       (jobId, phase, line) => { try { io.emit(`migration:log:${jobId}`, { phase, line }); } catch { /* noop */ } },
       (jobId) => { try { io.emit(`migration:done:${jobId}`, {}); } catch { /* noop */ } },
-    );
+    ));
 
     // Cross-engine pipeline (Mongo ↔ Postgres ↔ MySQL), per-run namespaces.
-    require('./pivot/migration/worker.js').startMigrationV2Worker(io);
+    pivotWorkers.push(require('./pivot/migration/worker.js').startMigrationV2Worker(io));
 
     // Cron scheduler for backup jobs. Async — reads schedules from the DB.
     require('./pivot/scheduler/index.js').startScheduler()
@@ -405,12 +409,67 @@ function startPivotWorkers() {
 }
 startPivotWorkers();
 
+// Graceful shutdown.
+//
+// The naive version — server.close(cb) and exit in the callback — does not
+// work for this process any more, for two reasons:
+//
+//  1. Socket.IO holds its connections open indefinitely. server.close() waits
+//     for existing connections to end, so with even one Monitor tab open the
+//     callback never fires, the process never exits, and the orchestrator
+//     SIGKILLs it (docker stop -t 30). Every deploy became a hard kill.
+//  2. BullMQ workers must be closed explicitly. Killed mid-job, the job stays
+//     'active' holding its lock until the stalled-job check reclaims it —
+//     so a deploy during a migration or backup stalled that job for minutes.
+//
+// Order matters: stop accepting new work, let in-flight jobs finish, then
+// drop connections. The whole thing is bounded by a hard timeout so a wedged
+// dependency can't stop us exiting either way.
+const SHUTDOWN_TIMEOUT_MS = Number(process.env.SHUTDOWN_TIMEOUT_MS) || 25_000;
+
+let shuttingDown = false;
 const shutdown = async (signal) => {
+  if (shuttingDown) return; // second SIGTERM shouldn't re-enter
+  shuttingDown = true;
   console.log(`\n[customdb-backend] ${signal} received, shutting down`);
-  server.close(async () => {
+
+  // Backstop: always exit, even if something below hangs. Must be shorter
+  // than the orchestrator's stop timeout (docker stop -t 30) so we get to
+  // exit on our own terms and log why.
+  const hardExit = setTimeout(() => {
+    console.warn('[customdb-backend] shutdown timed out — forcing exit');
+    process.exit(1);
+  }, SHUTDOWN_TIMEOUT_MS);
+  hardExit.unref();
+
+  try {
+    // Stop taking new HTTP requests immediately.
+    server.close();
+
+    // Disconnect websocket clients so server.close() can actually settle.
+    await new Promise((resolve) => {
+      try { io.close(resolve); } catch { resolve(); }
+    });
+
+    // Let each worker finish its current job and release the lock. BullMQ's
+    // close() is graceful by default; failures here must not block the rest.
+    await Promise.allSettled(
+      pivotWorkers.filter(Boolean).map((w) => w.close())
+    );
+
+    // Release pooled connections to customer databases.
+    try {
+      await require('./pivot/lib/mongo.js').closeAllClients();
+    } catch { /* pool may never have been opened */ }
+
     await prisma.$disconnect();
+    console.log('[customdb-backend] shutdown complete');
+    clearTimeout(hardExit);
     process.exit(0);
-  });
+  } catch (err) {
+    console.error('[customdb-backend] error during shutdown:', err.message);
+    process.exit(1);
+  }
 };
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
