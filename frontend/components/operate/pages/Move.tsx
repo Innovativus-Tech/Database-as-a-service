@@ -3,6 +3,9 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Download, RefreshCw } from 'lucide-react'
 import { api, type Connection, type ExportJob } from '../lib/api'
 
+// Same-origin on purpose: this hits /api/*, which the Next.js server proxies
+// through to the backend. Unlike the Socket.IO clients, it must NOT point at
+// the API origin — that would make it a needless cross-origin request.
 const BASE = ''
 
 async function downloadExport(jobId: string, format: string, exportType?: string) {

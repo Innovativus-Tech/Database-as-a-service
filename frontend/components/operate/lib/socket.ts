@@ -1,7 +1,14 @@
 import { io, Socket } from 'socket.io-client'
 
-// Same-origin; Socket.IO shares the backend's HTTP listener.
-const BASE = ''
+// Socket.IO runs on the BACKEND's HTTP listener, so these connections must
+// target the API origin — NOT the dashboard's. The Next.js server proxies
+// /api/* to the backend but has no /socket.io handler, so a same-origin
+// socket URL 404s and the live streams never connect.
+//
+// Cross-origin is expected here and already handled: the backend configures
+// Socket.IO CORS against FRONTEND_ORIGIN. Empty string (same origin) is kept
+// as the fallback for setups that front both on one host.
+const BASE = process.env.NEXT_PUBLIC_API_URL ?? ''
 
 const sockets = new Map<string, Socket>()
 

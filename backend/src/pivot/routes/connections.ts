@@ -34,6 +34,81 @@ const InviteViewerBody = z.object({
 });
 
 export async function connectionRoutes(app: FastifyInstance) {
+  // NOTE: the literal /team routes are registered BEFORE the parameterised
+  // /:id routes on purpose. Express matches in registration order, so with
+  // /:id first, GET /connections/team resolved to the connection lookup with
+  // id="team" and always 404'd instead of listing workspace members.
+
+  // ── Team members ───────────────────────────────────────────────────────────
+  //
+  // PivotDB's original auth routes (/auth/status, /auth/login, /auth/register)
+  // and its superadmin profile CRUD lived here. In the merged product CustomDB
+  // owns authentication — a user signs in once at /api/auth and already has
+  // this entire feature set — so those routes are gone.
+  //
+  // What remains is the genuinely useful part: inviting a read-only teammate
+  // into YOUR workspace. Scoping is implicit (always the caller's own
+  // workspace), so the old "can only invite to your own profile" checks and
+  // the cross-tenant profile listing are no longer reachable states.
+
+  app.get('/team', { preHandler: [app.authenticate] }, async (req) => {
+    const { profileId } = profileScope(req) as { profileId: string };
+    return prisma.user.findMany({
+      where: { profileId },
+      select: {
+        id: true, email: true, fullName: true, profileRole: true,
+        createdAt: true, lastLoginAt: true,
+      },
+      orderBy: { createdAt: 'asc' },
+    });
+  });
+
+  app.post('/team', { preHandler: [app.authenticate] }, async (req, reply) => {
+    if (!requireAdmin(req, reply)) return;
+    const parsed = InviteViewerBody.safeParse(req.body);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'Invalid input' });
+    }
+    const { profileId } = profileScope(req) as { profileId: string };
+    const actor = req.user as { id: string };
+    const { email, password } = parsed.data;
+    const passwordHash = await bcrypt.hash(password, 12);
+    try {
+      const viewer = await prisma.user.create({
+        data: {
+          email: email.toLowerCase(),
+          passwordHash,
+          role: 'user',
+          profileRole: 'viewer',
+          profileId,
+          invitedBy: actor.id,
+        },
+        select: { id: true, email: true, profileRole: true },
+      });
+      return reply.code(201).send(viewer);
+    } catch {
+      return reply.code(409).send({ error: 'An account with that email already exists' });
+    }
+  });
+
+  app.delete('/team/:userId', { preHandler: [app.authenticate] }, async (req, reply) => {
+    if (!requireAdmin(req, reply)) return;
+    const { userId } = req.params as { userId: string };
+    const { profileId } = profileScope(req) as { profileId: string };
+
+    // Only invited read-only members can be removed this way. The workspace
+    // owner is never deletable here — that is account deletion, which lives
+    // behind /api/auth and tears down their databases too.
+    const member = await prisma.user.findFirst({
+      where: { id: userId, profileId, profileRole: 'viewer' },
+      select: { id: true },
+    });
+    if (!member) return reply.code(404).send({ error: 'Team member not found' });
+
+    await prisma.user.delete({ where: { id: member.id } });
+    return reply.code(204).send();
+  });
+
   app.get('/', { preHandler: [app.authenticate] }, async (req) => {
     const scope = profileScope(req);
     return listConnections(scope);
@@ -184,75 +259,5 @@ export async function connectionRoutes(app: FastifyInstance) {
       }
       return reply.code(500).send({ error: `Cannot connect to ${conn.dbType} server: ${msg}` });
     }
-  });
-
-  // ── Team members ───────────────────────────────────────────────────────────
-  //
-  // PivotDB's original auth routes (/auth/status, /auth/login, /auth/register)
-  // and its superadmin profile CRUD lived here. In the merged product CustomDB
-  // owns authentication — a user signs in once at /api/auth and already has
-  // this entire feature set — so those routes are gone.
-  //
-  // What remains is the genuinely useful part: inviting a read-only teammate
-  // into YOUR workspace. Scoping is implicit (always the caller's own
-  // workspace), so the old "can only invite to your own profile" checks and
-  // the cross-tenant profile listing are no longer reachable states.
-
-  app.get('/team', { preHandler: [app.authenticate] }, async (req) => {
-    const { profileId } = profileScope(req) as { profileId: string };
-    return prisma.user.findMany({
-      where: { profileId },
-      select: {
-        id: true, email: true, fullName: true, profileRole: true,
-        createdAt: true, lastLoginAt: true,
-      },
-      orderBy: { createdAt: 'asc' },
-    });
-  });
-
-  app.post('/team', { preHandler: [app.authenticate] }, async (req, reply) => {
-    if (!requireAdmin(req, reply)) return;
-    const parsed = InviteViewerBody.safeParse(req.body);
-    if (!parsed.success) {
-      return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'Invalid input' });
-    }
-    const { profileId } = profileScope(req) as { profileId: string };
-    const actor = req.user as { id: string };
-    const { email, password } = parsed.data;
-    const passwordHash = await bcrypt.hash(password, 12);
-    try {
-      const viewer = await prisma.user.create({
-        data: {
-          email: email.toLowerCase(),
-          passwordHash,
-          role: 'user',
-          profileRole: 'viewer',
-          profileId,
-          invitedBy: actor.id,
-        },
-        select: { id: true, email: true, profileRole: true },
-      });
-      return reply.code(201).send(viewer);
-    } catch {
-      return reply.code(409).send({ error: 'An account with that email already exists' });
-    }
-  });
-
-  app.delete('/team/:userId', { preHandler: [app.authenticate] }, async (req, reply) => {
-    if (!requireAdmin(req, reply)) return;
-    const { userId } = req.params as { userId: string };
-    const { profileId } = profileScope(req) as { profileId: string };
-
-    // Only invited read-only members can be removed this way. The workspace
-    // owner is never deletable here — that is account deletion, which lives
-    // behind /api/auth and tears down their databases too.
-    const member = await prisma.user.findFirst({
-      where: { id: userId, profileId, profileRole: 'viewer' },
-      select: { id: true },
-    });
-    if (!member) return reply.code(404).send({ error: 'Team member not found' });
-
-    await prisma.user.delete({ where: { id: member.id } });
-    return reply.code(204).send();
   });
 }
