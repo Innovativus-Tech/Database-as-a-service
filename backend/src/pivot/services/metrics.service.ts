@@ -45,65 +45,88 @@ export class MetricsService {
   async collectAll(): Promise<void> {
     const connections = await prisma.connection.findMany();
 
-    for (const conn of connections) {
-      // Skip non-MongoDB connections — they have their own metrics service (sql-metrics.service.ts)
-      if ((conn as { dbType?: string }).dbType && (conn as { dbType?: string }).dbType !== 'mongodb') continue;
-      // Declared outside the try so `finally` can always close it. Keeping the
-      // close() inside the try leaked a MongoClient on every scrape that threw
-      // — and one reliably did: before clusterMonitor was granted, every
-      // serverStatus call failed authorisation, so Prometheus leaked a client
-      // per database every 15s until the pool was exhausted.
-      let client: MongoClient | undefined;
-      try {
-        const uri    = decrypt(conn.encryptedUri);
-        client = new MongoClient(uri, { serverSelectionTimeoutMS: 3000 });
-        await client.connect();
-        const admin  = client.db('admin');
-        const lbs    = { connection_id: conn.id, connection_name: conn.name };
+    // Collect every connection CONCURRENTLY.
+    //
+    // This used to be a sequential for-loop, which made the scrape cost the
+    // SUM of all connections rather than the slowest one. Each client is given
+    // serverSelectionTimeoutMS: 3000, so with 7 databases an outage pushed the
+    // scrape past 21s — well beyond Prometheus's 10s default scrape_timeout.
+    // Prometheus then aborted the request, and because the response never
+    // completed, NOTHING was recorded: one slow or unreachable database
+    // silently blackholed the metrics of every healthy one, and Grafana
+    // rendered empty panels across the board.
+    //
+    // allSettled (not all) so a single rejection can't discard the batch —
+    // though collectOne already swallows its own errors. Matches how
+    // sql-metrics.service.ts has always done it.
+    await Promise.allSettled(
+      connections
+        // Non-Mongo connections have their own collector (sql-metrics.service.ts).
+        .filter((conn) => {
+          const t = (conn as { dbType?: string }).dbType;
+          return !t || t === 'mongodb';
+        })
+        .map((conn) => this.collectOne(conn)),
+    );
+  }
 
-        const status = await admin.command({ serverStatus: 1 });
+  /** Collect gauges from one Mongo connection. Never throws. */
+  private async collectOne(conn: { id: string; name: string; encryptedUri: string; topology: string }): Promise<void> {
+    // Declared outside the try so `finally` can always close it. Keeping the
+    // close() inside the try leaked a MongoClient on every scrape that threw
+    // — and one reliably did: before clusterMonitor was granted, every
+    // serverStatus call failed authorisation, so Prometheus leaked a client
+    // per database every 15s until the pool was exhausted.
+    let client: MongoClient | undefined;
+    try {
+      const uri    = decrypt(conn.encryptedUri);
+      client = new MongoClient(uri, { serverSelectionTimeoutMS: 3000 });
+      await client.connect();
+      const admin  = client.db('admin');
+      const lbs    = { connection_id: conn.id, connection_name: conn.name };
 
-        this.connectionsCurrentGauge.set(lbs, status.connections.current);
-        this.connectionsAvailableGauge.set(lbs, status.connections.available);
+      const status = await admin.command({ serverStatus: 1 });
 
-        const prev     = this.prevOpcounters.get(conn.id) ?? status.opcounters;
-        const interval = 15;
-        this.opsInsertGauge.set(lbs,  Math.max(0, (status.opcounters.insert  - (prev['insert']  ?? 0)) / interval));
-        this.opsQueryGauge.set(lbs,   Math.max(0, (status.opcounters.query   - (prev['query']   ?? 0)) / interval));
-        this.opsUpdateGauge.set(lbs,  Math.max(0, (status.opcounters.update  - (prev['update']  ?? 0)) / interval));
-        this.opsDeleteGauge.set(lbs,  Math.max(0, (status.opcounters.delete  - (prev['delete']  ?? 0)) / interval));
-        this.opsGetmoreGauge.set(lbs, Math.max(0, (status.opcounters.getmore - (prev['getmore'] ?? 0)) / interval));
-        this.prevOpcounters.set(conn.id, { ...status.opcounters });
+      this.connectionsCurrentGauge.set(lbs, status.connections.current);
+      this.connectionsAvailableGauge.set(lbs, status.connections.available);
 
-        this.memResidentMbGauge.set(lbs, status.mem.resident);
-        this.memVirtualMbGauge.set(lbs,  status.mem.virtual);
-        this.networkBytesInGauge.set(lbs,  status.network.bytesIn);
-        this.networkBytesOutGauge.set(lbs, status.network.bytesOut);
+      const prev     = this.prevOpcounters.get(conn.id) ?? status.opcounters;
+      const interval = 15;
+      this.opsInsertGauge.set(lbs,  Math.max(0, (status.opcounters.insert  - (prev['insert']  ?? 0)) / interval));
+      this.opsQueryGauge.set(lbs,   Math.max(0, (status.opcounters.query   - (prev['query']   ?? 0)) / interval));
+      this.opsUpdateGauge.set(lbs,  Math.max(0, (status.opcounters.update  - (prev['update']  ?? 0)) / interval));
+      this.opsDeleteGauge.set(lbs,  Math.max(0, (status.opcounters.delete  - (prev['delete']  ?? 0)) / interval));
+      this.opsGetmoreGauge.set(lbs, Math.max(0, (status.opcounters.getmore - (prev['getmore'] ?? 0)) / interval));
+      this.prevOpcounters.set(conn.id, { ...status.opcounters });
 
-        const wt = status.wiredTiger?.cache;
-        if (wt) {
-          this.wtCacheUsedBytesGauge.set(lbs, wt['bytes currently in the cache'] ?? 0);
-          this.wtCacheMaxBytesGauge.set(lbs,  wt['maximum bytes configured'] ?? 0);
-        }
+      this.memResidentMbGauge.set(lbs, status.mem.resident);
+      this.memVirtualMbGauge.set(lbs,  status.mem.virtual);
+      this.networkBytesInGauge.set(lbs,  status.network.bytesIn);
+      this.networkBytesOutGauge.set(lbs, status.network.bytesOut);
 
-        if (conn.topology === 'replicaSet') {
-          try {
-            const rsStatus = await admin.command({ replSetGetStatus: 1 });
-            const primary  = rsStatus.members.find((m: Record<string, unknown>) => m['stateStr'] === 'PRIMARY');
-            for (const member of rsStatus.members as Array<Record<string, unknown>>) {
-              if (member['stateStr'] === 'SECONDARY' && (primary?.['optimeDate'] as Date) && (member['optimeDate'] as Date)) {
-                const lagMs = (primary!['optimeDate'] as Date).getTime() - (member['optimeDate'] as Date).getTime();
-                this.replicationLagSecondsGauge.set({ ...lbs, member: member['name'] as string }, lagMs / 1000);
-              }
-            }
-          } catch { /* not authorised or standalone */ }
-        }
-
-      } catch (err) {
-        console.error(`[metrics] Failed to collect from ${conn.id}:`, (err as Error).message);
-      } finally {
-        await client?.close().catch(() => {});
+      const wt = status.wiredTiger?.cache;
+      if (wt) {
+        this.wtCacheUsedBytesGauge.set(lbs, wt['bytes currently in the cache'] ?? 0);
+        this.wtCacheMaxBytesGauge.set(lbs,  wt['maximum bytes configured'] ?? 0);
       }
+
+      if (conn.topology === 'replicaSet') {
+        try {
+          const rsStatus = await admin.command({ replSetGetStatus: 1 });
+          const primary  = rsStatus.members.find((m: Record<string, unknown>) => m['stateStr'] === 'PRIMARY');
+          for (const member of rsStatus.members as Array<Record<string, unknown>>) {
+            if (member['stateStr'] === 'SECONDARY' && (primary?.['optimeDate'] as Date) && (member['optimeDate'] as Date)) {
+              const lagMs = (primary!['optimeDate'] as Date).getTime() - (member['optimeDate'] as Date).getTime();
+              this.replicationLagSecondsGauge.set({ ...lbs, member: member['name'] as string }, lagMs / 1000);
+            }
+          }
+        } catch { /* not authorised or standalone */ }
+      }
+
+    } catch (err) {
+      console.error(`[metrics] Failed to collect from ${conn.id}:`, (err as Error).message);
+    } finally {
+      await client?.close().catch(() => {});
     }
   }
 
