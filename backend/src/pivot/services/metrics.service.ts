@@ -48,9 +48,15 @@ export class MetricsService {
     for (const conn of connections) {
       // Skip non-MongoDB connections — they have their own metrics service (sql-metrics.service.ts)
       if ((conn as { dbType?: string }).dbType && (conn as { dbType?: string }).dbType !== 'mongodb') continue;
+      // Declared outside the try so `finally` can always close it. Keeping the
+      // close() inside the try leaked a MongoClient on every scrape that threw
+      // — and one reliably did: before clusterMonitor was granted, every
+      // serverStatus call failed authorisation, so Prometheus leaked a client
+      // per database every 15s until the pool was exhausted.
+      let client: MongoClient | undefined;
       try {
         const uri    = decrypt(conn.encryptedUri);
-        const client = new MongoClient(uri, { serverSelectionTimeoutMS: 3000 });
+        client = new MongoClient(uri, { serverSelectionTimeoutMS: 3000 });
         await client.connect();
         const admin  = client.db('admin');
         const lbs    = { connection_id: conn.id, connection_name: conn.name };
@@ -93,9 +99,10 @@ export class MetricsService {
           } catch { /* not authorised or standalone */ }
         }
 
-        await client.close();
       } catch (err) {
         console.error(`[metrics] Failed to collect from ${conn.id}:`, (err as Error).message);
+      } finally {
+        await client?.close().catch(() => {});
       }
     }
   }
