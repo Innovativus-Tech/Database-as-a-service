@@ -146,6 +146,48 @@ async function reprovisionAllRedisAcls() {
   return dbs.length;
 }
 
+// Mongo databases provisioned before the PivotDB merge were created with only
+// readWriteAnyDatabase + dbAdminAnyDatabase — CustomDB had no monitoring
+// feature, so cluster-level reads were never needed. The Monitor page calls
+// serverStatus/replSetGetStatus/currentOp/listDatabases, all of which require
+// clusterMonitor, so on those databases it fails with "not authorized on admin
+// to execute command { serverStatus: 1 }".
+//
+// The user-creation init script only runs on a FRESH data dir, so new-database
+// fixes never reach existing ones — they have to be repaired in place.
+//
+// Run on a schedule, not just at boot. A single boot-time attempt is fragile:
+// if the container is still starting (mongod accepts connections a good while
+// after `docker start` returns), or the grant hits any transient error, the
+// user is left staring at a permanent authorisation banner until someone
+// redeploys. Same reasoning, and the same 10-minute cadence, as the Redis ACL
+// healer above. grantRolesToUser is idempotent, so repeats are free.
+async function reprovisionMongoMonitorRoles() {
+  const { ensureMongoMonitorRole } = require('./services/provisioning');
+  const dbs = await prisma.database.findMany({
+    where: { status: 'active', type: 'nosql' },
+    include: { credentials: true },
+  });
+
+  let granted = 0;
+  let failed = 0;
+  for (const db of dbs) {
+    const cred = db.credentials[0];
+    if (!cred) continue;
+    try {
+      if (await ensureMongoMonitorRole(db, cred.username) === 'granted') {
+        granted++;
+        console.log(`[mongo-roles] granted clusterMonitor to ${db.dbName}`);
+      }
+    } catch (err) {
+      failed++;
+      console.warn(`[mongo-roles] ${db.dbName}: ${err.message}`);
+    }
+  }
+  if (failed > 0) console.warn(`[mongo-roles] ${failed}/${dbs.length} grant(s) failed — will retry in 10 min`);
+  return granted;
+}
+
 // One-time upgrade of Mongo rows created before shared-port gateway routing:
 // they were reachable through per-database published ports, and those port
 // ranges are no longer published. Mint each one a gateway hostname and flip
@@ -210,7 +252,7 @@ async function ensureAdminUser() {
 async function bootstrap() {
   const { ensureNetwork } = require('./services/dockerNetwork');
   const { syncFromDatabaseRows, reloadNginx } = require('./services/nginxManager');
-  const { ensureContainerRunning, ensureMongoMonitorRole } = require('./services/provisioning');
+  const { ensureContainerRunning } = require('./services/provisioning');
   const { decrypt } = require('./services/crypto');
   const { backfillManagedConnections } = require('./services/connectionSync');
   try {
@@ -250,21 +292,6 @@ async function bootstrap() {
           const password = decrypt(cred.passwordEncrypted);
           const action = await ensureContainerRunning({ db, username: cred.username, password });
           if (action !== 'running') console.log(`[bootstrap:bg] ${db.dbName}: container ${action}`);
-
-          // Databases provisioned before the PivotDB merge lack the
-          // clusterMonitor role, so the Monitor page fails against them with
-          // "not authorized on admin to execute command { serverStatus: 1 }".
-          // The user-creation init script only runs on a fresh data dir, so
-          // existing databases have to be repaired in place. Idempotent and
-          // best-effort — a failure here must never block reconciliation.
-          if (db.type === 'nosql') {
-            try {
-              const granted = await ensureMongoMonitorRole(db, cred.username);
-              if (granted === 'granted') console.log(`[bootstrap:bg] ${db.dbName}: granted clusterMonitor`);
-            } catch (err) {
-              console.warn(`[bootstrap:bg] ${db.dbName}: clusterMonitor grant failed:`, err.message);
-            }
-          }
         } catch (err) {
           console.error(`[bootstrap:bg] failed to reconcile ${db.dbName}:`, err.message);
         }
@@ -292,6 +319,19 @@ async function bootstrap() {
       .catch((err) => console.warn('[redis-acl] initial sweep failed:', err.message));
     setInterval(() => {
       reprovisionAllRedisAcls().catch(() => {});
+    }, 10 * 60 * 1000).unref();
+
+    // clusterMonitor healer — same cadence and rationale as the Redis ACL
+    // sweep above. Delayed slightly on boot so mongod in any container we
+    // just restarted has time to start accepting connections; a failure here
+    // is retried on the next tick rather than being terminal.
+    setTimeout(() => {
+      reprovisionMongoMonitorRoles()
+        .then((n) => { if (n > 0) console.log(`[mongo-roles] repaired ${n} database(s)`); })
+        .catch((err) => console.warn('[mongo-roles] initial sweep failed:', err.message));
+    }, 20_000).unref();
+    setInterval(() => {
+      reprovisionMongoMonitorRoles().catch(() => {});
     }, 10 * 60 * 1000).unref();
   } catch (err) {
     console.warn('[bootstrap] non-fatal init warning:', err.message);
