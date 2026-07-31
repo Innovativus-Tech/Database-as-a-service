@@ -6,8 +6,10 @@ import Link from 'next/link';
 import { toast } from 'sonner';
 import {
   ArrowLeft, Table2, Upload, Link2, RotateCw, Trash2, Copy, Eye, EyeOff, Leaf, Database,
+  FileCheck, X,
 } from 'lucide-react';
 import { api } from '@/lib/api';
+import { cn } from '@/lib/cn';
 import { useRequireAuth, useAuth } from '@/lib/auth';
 import CopyButton from '@/components/CopyButton';
 import DataBrowser from '@/components/DataBrowser';
@@ -49,6 +51,12 @@ export default function DatabaseDetailPage() {
   const [importError, setImportError] = useState(null);
   const [importProgress, setImportProgress] = useState(null); // { processed, total }
   const [sourceMongoUri, setSourceMongoUri] = useState('');
+  // The chosen file is React state, not just whatever happens to be sitting on
+  // the <input> at submit time. Reading it only from the ref meant nothing
+  // re-rendered when a file was picked, so the drop zone gave no feedback and
+  // the user couldn't tell whether their selection had registered.
+  const [selectedFile, setSelectedFile] = useState(null);
+  const [dragActive, setDragActive] = useState(false);
   const fileInputRef = useRef(null);
   const targetInputRef = useRef(null);
   const pollRef = useRef(null);
@@ -104,7 +112,10 @@ export default function DatabaseDetailPage() {
             setImportResult(status.result);
             setImportBusy(false);
             setImportProgress(null);
-            if (clearFile && fileInputRef.current) fileInputRef.current.value = '';
+            if (clearFile) {
+              setSelectedFile(null);
+              if (fileInputRef.current) fileInputRef.current.value = '';
+            }
             toast.success('Import complete');
             refreshStats();
           } else if (status.status === 'error') {
@@ -132,7 +143,7 @@ export default function DatabaseDetailPage() {
     setImportError(null);
     setImportResult(null);
     setImportProgress(null);
-    const file = fileInputRef.current?.files?.[0];
+    const file = selectedFile;
     if (!file) { setImportError('Choose a file first'); return; }
     setImportBusy(true);
     try {
@@ -523,22 +534,75 @@ export default function DatabaseDetailPage() {
                   : 'Accepted: .csv (auto-creates a table) or a pg_dump .sql file.'}
               </p>
               <form onSubmit={onImport} className="space-y-3">
-                {/* Drop zone */}
-                <div className="border-2 border-dashed border-border rounded-lg p-7 text-center">
-                  <Upload className="h-8 w-8 mx-auto text-text-muted mb-2.5" strokeWidth={1.5} />
-                  <div className="text-base font-medium">Drag your file here</div>
-                  <div className="text-sm text-text-secondary mt-1">
-                    or <label className="text-accent underline cursor-pointer">
-                      click to browse
-                      <input
-                        ref={fileInputRef}
-                        type="file"
-                        accept={isMongo ? '.json,.csv,.zip' : '.csv,.sql'}
-                        className="hidden"
-                      />
-                    </label>
-                  </div>
-                  <div className="text-xs text-text-muted mt-2">Max 200MB</div>
+                {/* Drop zone. The dashed box previously said "Drag your file
+                    here" but had no drag handlers at all, so dropping did
+                    nothing; and the <input> had no onChange, so choosing a file
+                    produced no visible change either. Both are wired now. */}
+                <div
+                  onDragOver={(e) => { e.preventDefault(); if (!importBusy) setDragActive(true); }}
+                  onDragLeave={(e) => { e.preventDefault(); setDragActive(false); }}
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    setDragActive(false);
+                    if (importBusy) return;
+                    const f = e.dataTransfer.files?.[0];
+                    if (f) { setSelectedFile(f); setImportError(null); }
+                  }}
+                  className={cn(
+                    'rounded-lg p-7 text-center transition-colors',
+                    dragActive
+                      ? 'border-2 border-dashed border-accent bg-accent-dim'
+                      : selectedFile
+                        ? 'border border-border-strong bg-bg-inset'
+                        : 'border-2 border-dashed border-border'
+                  )}
+                >
+                  {selectedFile ? (
+                    <div className="flex items-center gap-3 text-left">
+                      <FileCheck className="h-8 w-8 flex-shrink-0 text-success" strokeWidth={1.5} />
+                      <div className="min-w-0 flex-1">
+                        <div className="truncate text-sm font-medium text-text-primary">
+                          {selectedFile.name}
+                        </div>
+                        <div className="text-xs text-text-muted">
+                          {fmtBytes(selectedFile.size)} · ready to import
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        disabled={importBusy}
+                        onClick={() => {
+                          setSelectedFile(null);
+                          if (fileInputRef.current) fileInputRef.current.value = '';
+                        }}
+                        className="flex-shrink-0 rounded p-1.5 text-text-secondary hover:bg-bg-row hover:text-text-primary disabled:opacity-40"
+                        aria-label="Remove selected file"
+                      >
+                        <X className="h-4 w-4" />
+                      </button>
+                    </div>
+                  ) : (
+                    <>
+                      <Upload className="h-8 w-8 mx-auto text-text-muted mb-2.5" strokeWidth={1.5} />
+                      <div className="text-base font-medium">Drag your file here</div>
+                      <div className="text-sm text-text-secondary mt-1">
+                        or <label className="text-accent underline cursor-pointer">
+                          click to browse
+                          <input
+                            ref={fileInputRef}
+                            type="file"
+                            accept={isMongo ? '.json,.csv,.zip' : '.csv,.sql'}
+                            className="hidden"
+                            onChange={(e) => {
+                              const f = e.target.files?.[0];
+                              if (f) { setSelectedFile(f); setImportError(null); }
+                            }}
+                          />
+                        </label>
+                      </div>
+                      <div className="text-xs text-text-muted mt-2">Max 200MB</div>
+                    </>
+                  )}
                 </div>
                 <input
                   ref={targetInputRef}
