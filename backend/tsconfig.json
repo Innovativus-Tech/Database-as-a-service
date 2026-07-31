@@ -1,0 +1,41 @@
+{
+  // The merged backend is a hybrid tree:
+  //
+  //   src/*.js, src/routes/*.js, src/services/*.js   CustomDB — CommonJS, require()
+  //   src/pivot/**/*.ts                              PivotDB  — ESM-authored TypeScript
+  //
+  // Rather than rewrite either half, we compile BOTH with tsc targeting
+  // CommonJS. TypeScript downlevels PivotDB's `import`/`export` to
+  // require()/exports, so the CustomDB Express code can `require()` the ported
+  // engine directly and both halves share one module graph, one process, and
+  // one Prisma client.
+  //
+  // Notes on specific settings:
+  //   allowJs  — the CustomDB half stays plain .js and is emitted as-is.
+  //   checkJs  — off: the .js half was never written against type declarations
+  //              and turning this on would produce thousands of errors that say
+  //              nothing about correctness. TS still type-checks all of src/pivot.
+  //   moduleResolution "node" — required for CJS output. PivotDB's imports carry
+  //              explicit `.js` extensions, which resolve correctly under both
+  //              this setting (source .ts) and at runtime (emitted .js).
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "CommonJS",
+    "moduleResolution": "node",
+    "lib": ["ES2022"],
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "strict": true,
+    "allowJs": true,
+    "checkJs": false,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "sourceMap": true,
+    "declaration": false
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist"]
+}
