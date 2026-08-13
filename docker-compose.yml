@@ -154,6 +154,12 @@ services:
       # customdb-network = so backend can reach user DB containers by name
       # for data browser / import (drivers use the internal Docker DNS).
       - customdb-network
+    labels:
+      # REQUIRED because this container sits on TWO networks. See the long
+      # explanation on the frontend service below — without this label Traefik
+      # picks one of the container's network IPs non-deterministically and can
+      # route to the customdb-network address, which Traefik cannot reach.
+      - "traefik.docker.network=coolify"
     restart: unless-stopped
     mem_reservation: 512m
     cpu_shares: 2048
@@ -193,6 +199,32 @@ services:
       # Internal app network = so same-origin /api/* requests can be proxied
       # from Next.js to the backend even if the public API domain is down.
       - customdb-network
+    labels:
+      # THE fix for the intermittent "Gateway Timeout" on the dashboard domain.
+      #
+      # This container is attached to TWO networks (coolify + customdb-network),
+      # so it has two internal IPs. Traefik's Docker provider has to pick ONE to
+      # forward to, and with no explicit instruction it iterates the container's
+      # network map — whose order Go randomises. So on every provider refresh
+      # (container start, redeploy, proxy restart) it is effectively a coin flip:
+      #
+      #   picks the coolify IP        -> site works
+      #   picks the customdb-network  -> Traefik has no route to that subnet, the
+      #     IP                           connection just hangs until Traefik's
+      #                                  30s dial timeout fires -> 504 with an
+      #                                  empty body ("Gateway Timeout")
+      #
+      # That is why it is intermittent, why it "fixes itself" on a redeploy, and
+      # why the container looks perfectly healthy while it happens: the compose
+      # healthcheck below dials 127.0.0.1 from INSIDE the container, so it never
+      # touches the path Traefik is failing on. Same reason the backend seems
+      # fine — nothing about the backend proves which IP Traefik chose for us.
+      #
+      # This label pins the forwarding IP to the network Traefik actually lives
+      # on, making the choice deterministic. Removing the host port publish
+      # (see the NOTE above) reduced how often the route went stale; it could
+      # not fix this, because this is a wrong-IP problem, not a stale-IP one.
+      - "traefik.docker.network=coolify"
     restart: unless-stopped
     # Reserve memory and lower the OOM priority so the Next server isn't the
     # kernel's first kill target under host memory pressure. Without this the
@@ -347,6 +379,10 @@ services:
     networks:
       - customdb-network
       - coolify
+    labels:
+      # Two networks -> Traefik must be told which IP to forward to, or the
+      # embedded Grafana panels 504 at random. See the frontend service.
+      - "traefik.docker.network=coolify"
     depends_on:
       - prometheus
     restart: unless-stopped

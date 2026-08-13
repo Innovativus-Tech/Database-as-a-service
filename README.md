@@ -256,6 +256,21 @@ level.
 - **Jobs need Redis**: migration, sync, backup, restore and export run on
   BullMQ. Without `REDIS_URL` the backend still starts and everything else
   works — it logs that those features are disabled rather than crash-looping.
+- **Intermittent "Gateway Timeout" on a public domain**: every publicly routed
+  service (`backend`, `frontend`, `grafana`) sits on **two** networks — `coolify`
+  (where Traefik lives) and `customdb-network` (where the DB containers live) —
+  so each has two internal IPs. Traefik forwards to only one of them, and with
+  no instruction it picks non-deterministically; if it picks the
+  `customdb-network` IP it has no route to that subnet, the connection hangs,
+  and after Traefik's 30 s dial timeout the browser gets a bare
+  `Gateway Timeout`. The container looks healthy throughout, because the compose
+  healthcheck dials `127.0.0.1` from inside the container and never crosses the
+  broken path. The `traefik.docker.network=coolify` label on those three
+  services pins the choice. **Any new service given a public domain must carry
+  that label too.** To confirm a live incident: `docker inspect` the container
+  and compare its `coolify` IP with the server address in Traefik's dashboard /
+  `/api/rawdata` — a mismatch is this bug; if they match, look at timeouts on
+  long uploads instead.
 
 ## Migrating existing deployments
 
